@@ -48,13 +48,54 @@
 
 ## 步驟二：下載這三個檔案
 
+兩種方式擇一：**手動下載**，或是**請你的 AI agent 幫你做**。
+
+### 方式 A：手動下載
+
 把 `agent.py`、`bridge.py`、`setup_student.py` 三個檔案放進同一個資料夾
 （例如 `D:\AspenPlusMCP_client\`）。三個檔案要放在一起，位置隨意，但
 不能拆開。
 
+### 方式 B：貼網址給 AI agent 安裝
+
+如果你在用 Claude Code、Claude Desktop 或其他有讀寫檔案與執行指令能力
+的 AI agent，可以把下面整段（含你已經拿到的 token）貼給它，讓它自動
+完成下載、環境檢查、寫入設定：
+
+```
+請幫我安裝 Aspen Plus MCP 學生端：
+
+1. 從 https://github.com/conlinkang/AspenPlusMCP_client 這個倉庫下載
+   agent.py、bridge.py、setup_student.py 三個檔案（用 git clone，或
+   直接抓這三個 raw 網址都可以：
+   https://raw.githubusercontent.com/conlinkang/AspenPlusMCP_client/master/agent.py
+   https://raw.githubusercontent.com/conlinkang/AspenPlusMCP_client/master/bridge.py
+   https://raw.githubusercontent.com/conlinkang/AspenPlusMCP_client/master/setup_student.py
+   ），三個檔案放同一個資料夾。
+
+2. 執行：
+   python setup_student.py --url http://192.168.50.113:8787 --token 你的token
+
+3. 如果它回報找不到同時裝有 pywin32 與 mcp 的 Python，先問我要用哪一個
+   直譯器（例如 D:\Aspen_MCP\.venv\Scripts\python.exe），再用
+   --python 那個路徑重新執行，不要自己亂猜或亂裝套件。
+
+4. 執行完告訴我結果，並提醒我要完全關閉再重新打開 Claude Desktop。
+```
+
+把 `你的token` 換成步驟一領到的那組 token。**這組文字裡只有 token 是
+機密，其他都是公開資訊**——貼給 agent 之前確認沒有把 token 貼漏或貼
+給不信任的地方。
+
+> 這個倉庫是公開的，任何 AI agent 都抓得到，不需要你的 GitHub 帳號
+> 授權；裡面確定不含任何工具邏輯或機密，只有轉發程式碼跟讀寫 Aspen
+> 節點的程式碼。
+
 ---
 
 ## 步驟三：執行安裝程式
+
+如果你用方式 B 讓 AI agent 代勞，這一步已經做完，可以直接跳到步驟四。
 
 打開命令提示字元，切到剛剛放檔案的資料夾，執行：
 
@@ -100,6 +141,7 @@ python setup_student.py --check
 | 雲端拒絕這組 token | token 打錯字，或帳號已被停權 —— 回 `/status` 用 email 重新查一次，或聯絡課程管理者 |
 | 連不到雲端 | 確認你在校內網路（目前只開放校內），且網址沒打錯 |
 | 叫不動 Aspen | 這台電腦沒裝 Aspen Plus，或授權沒生效／過期 |
+| （方式 B）AI agent 說抓不到 GitHub 網址 | 確認這台電腦能連外網；倉庫是公開的，不需要登入或授權 |
 | Claude Desktop 裡看不到 aspen 工具 | 確認有**完全關閉**再重開，不是只是切到背景 |
 
 用量或帳號問題（配額用完、忘記 token、需要調整身分）請聯絡課程管理者。
