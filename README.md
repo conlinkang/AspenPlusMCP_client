@@ -1,0 +1,105 @@
+# Aspen Plus MCP 學生端
+
+讓 Claude Desktop 能操作你電腦上的 Aspen Plus，透過課程的雲端伺服器取得工具邏輯。
+
+這個資料夾只有三個檔案，就是完整的本地端：
+
+| 檔案 | 做什麼 |
+|---|---|
+| `agent.py` | 跟 Claude Desktop 對話的 MCP 伺服器，把工具呼叫轉發給雲端 |
+| `bridge.py` | 讀寫你電腦上 Aspen Plus 的資料節點 |
+| `setup_student.py` | 安裝程式：檢查環境、測連線、寫入 Claude Desktop 設定 |
+
+不含任何工具邏輯（怎麼判斷收斂、怎麼設定反應、怎麼跑經濟分析……）——
+那些都在雲端伺服器上執行，這裡只負責「转发」跟「操作 Aspen」。
+
+> **目前只能在校內網路使用**（伺服器暫不對外開放）。校外／宿舍網路連
+> 不到雲端伺服器，請在教室或校內網段操作。
+
+---
+
+## 前置需求
+
+- 這台電腦已經安裝 **Aspen Plus** 並且授權可以正常開啟
+- 一個裝了 `pywin32` 與 `mcp` 套件的 Python（課程機房的 Aspen 環境
+  通常已經有，例如 `D:\Aspen_MCP\.venv\Scripts\python.exe`；如果沒有，
+  自己找個 Python 裝：`python -m pip install pywin32 mcp`）
+- 已安裝 **Claude Desktop**
+
+---
+
+## 步驟一：申請帳號
+
+1. 在校內網路瀏覽器開啟：**http://192.168.50.113:8787/signup**
+2. 填寫：
+   - **學術 email**（用來收驗證信）
+   - **姓名**
+   - **身分**：教師 / 學生
+3. 送出後會收到一封驗證信，**24 小時內**點裡面的連結完成驗證
+4. 驗證完成後，申請會送交課程管理者審核
+5. 審核通過後（**不會另外寄信通知**），自己回到
+   **http://192.168.50.113:8787/status**，輸入 email 查詢，
+   會看到一組 **token**（**只顯示這一次**，請立刻複製保存 —— 沒存到
+   只能請管理者重新產生一組）
+
+每個帳號預設每月可呼叫工具 **1000 次**，每月自動重置。
+
+---
+
+## 步驟二：下載這三個檔案
+
+把 `agent.py`、`bridge.py`、`setup_student.py` 三個檔案放進同一個資料夾
+（例如 `D:\AspenPlusMCP_client\`）。三個檔案要放在一起，位置隨意，但
+不能拆開。
+
+---
+
+## 步驟三：執行安裝程式
+
+打開命令提示字元，切到剛剛放檔案的資料夾，執行：
+
+```bash
+python setup_student.py --url http://192.168.50.113:8787 --token 你的token
+```
+
+（如果你的 Aspen 環境不是系統預設的 `python`，可以用 `--python` 指定，
+例如 `--python D:\Aspen_MCP\.venv\Scripts\python.exe`）
+
+這支程式會依序做四件事，任何一步失敗都會停下來並說明原因：
+
+1. 找一個同時裝有 `pywin32` 與 `mcp` 的 Python
+2. 測試能不能連到雲端、token 對不對
+3. 測試能不能叫得動這台電腦上的 Aspen
+4. 把設定寫進 Claude Desktop 的設定檔
+   （`%APPDATA%\Claude\claude_desktop_config.json`，只新增/更新
+   `aspen` 這一項，其他既有的 MCP 設定不會被動到；原檔案會備份成
+   `.json.bak`）
+
+只想檢查環境、還不想寫入設定的話，加 `--check`：
+
+```bash
+python setup_student.py --check
+```
+
+---
+
+## 步驟四：重新啟動 Claude Desktop
+
+**完全關閉**再重新打開（不是縮到最小化）—— Claude Desktop 只在啟動時
+讀取設定檔，不重開不會生效。
+
+打開後在對話裡應該能看到 `aspen` 這個 MCP 工具已經連上。
+
+---
+
+## 疑難排解
+
+| 安裝程式回報 | 原因 / 怎麼處理 |
+|---|---|
+| 找不到同時裝有 pywin32 與 mcp 的 Python | 用 `--python` 指定正確的直譯器，或在某個環境跑 `pip install pywin32 mcp` |
+| 雲端拒絕這組 token | token 打錯字，或帳號已被停權 —— 回 `/status` 用 email 重新查一次，或聯絡課程管理者 |
+| 連不到雲端 | 確認你在校內網路（目前只開放校內），且網址沒打錯 |
+| 叫不動 Aspen | 這台電腦沒裝 Aspen Plus，或授權沒生效／過期 |
+| Claude Desktop 裡看不到 aspen 工具 | 確認有**完全關閉**再重開，不是只是切到背景 |
+
+用量或帳號問題（配額用完、忘記 token、需要調整身分）請聯絡課程管理者。
