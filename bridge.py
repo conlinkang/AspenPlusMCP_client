@@ -14,6 +14,7 @@ from __future__ import annotations
 import glob
 import io
 import os
+import subprocess
 import threading
 import time
 from typing import Any
@@ -92,6 +93,41 @@ def _err(code: str, detail: str = "") -> dict:
             "error": {"code": code, "detail": str(detail)[:500]}}
 
 
+# ── 殘留的 Aspen 行程 ───────────────────────────────────────────────
+# Aspen 掛掉、或這支程式被砍掉來不及關檔時，AspenPlus.exe 會留下來，
+# 而且鎖著剛才那個 .bkp。下一次開檔就報「Unable to open file」，訊息
+# 裡完全看不出原因 —— 使用者只能自己去工作管理員找。
+def _aspen_pids() -> list:
+    """目前機器上所有 AspenPlus.exe 的行程編號。查不到就回空清單。"""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq AspenPlus.exe", "/NH", "/FO",
+             "CSV"], capture_output=True, text=True, timeout=15)
+    except Exception:
+        return []
+    pids = []
+    for line in (out.stdout or "").splitlines():
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[0].lower().startswith("aspenplus"):
+            try:
+                pids.append(int(parts[1]))
+            except ValueError:
+                pass
+    return pids
+
+
+def _pid_alive(pid: int) -> bool:
+    return pid in _aspen_pids()
+
+
+def _kill_pid(pid: int) -> None:
+    try:
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
 class Bridge:
     """20 個通用動作。不含業務邏輯。"""
 
@@ -102,6 +138,7 @@ class Bridge:
         self._run_done: threading.Event | None = None
         self._run_error: str | None = None
         self._path: str | None = None      # 目前開著的檔，用來找 history 檔
+        self._pid: int | None = None       # 自己這一份 Aspen 的行程編號
         self.op_count = 0
 
     # ══ 連線與檔案 ══════════════════════════════════════════════════
@@ -124,7 +161,13 @@ class Bridge:
         progid = "Apwn.Document.{}.0".format(version) if version else "Apwn.Document"
         try:
             self.app = win32.Dispatch(progid)
-            return _ok({"progid": progid})
+            # 記下行程編號。關檔時要確認這一份真的結束了，開檔失敗時也
+            # 要能把「別人留下的」和「自己這一份」分開講。
+            try:
+                self._pid = int(self.app.ProcessId)
+            except Exception:
+                self._pid = None
+            return _ok({"progid": progid, "pid": self._pid})
         except Exception as exc:
             return _err("COM_ERROR", repr(exc))
 
@@ -157,7 +200,33 @@ class Bridge:
             self._path = path
             return _ok({"path": path, "loader": loader})
         except Exception as exc:
-            return _err("COM_ERROR", repr(exc))
+            return _err("COM_ERROR", self._open_failure(repr(exc)))
+
+    def _open_failure(self, detail: str) -> str:
+        """開檔失敗時，把能查到的線索一起帶回去。
+
+        Aspen 自己的 FailedToOpenDescription 有時是空的（實測「檔案不
+        存在」就是空的），所以不能只靠它。真正常見的原因是別的
+        AspenPlus.exe 還鎖著那個檔，那個用行程清單就看得出來。
+        """
+        parts = [detail]
+        for attr in ("FailedToOpenDescription", "FailedToOpenKey"):
+            try:
+                said = getattr(self.app, attr)
+            except Exception:
+                continue
+            if said:
+                parts.append("Aspen 說：{}".format(said))
+        others = [p for p in _aspen_pids() if p != self._pid]
+        if others:
+            parts.append(
+                "另外有 {} 個 AspenPlus.exe 還在跑（PID {}）。這類殘留會鎖住 "
+                ".bkp，是開檔失敗最常見的原因。確認畫面上沒有你自己開著、"
+                "還沒存檔的 Aspen 之後，可以用 "
+                "Stop-Process -Id {} -Force 清掉再重試。".format(
+                    len(others), "、".join(str(p) for p in others),
+                    ",".join(str(p) for p in others)))
+        return "；".join(parts)
 
     def save(self, path: str | None = None, overwrite: bool | None = None,
              export_type: int | None = None) -> dict:
@@ -198,6 +267,18 @@ class Bridge:
             return _err("COM_ERROR", repr(exc))
 
     def close(self) -> dict:
+        """關掉這一份 Aspen，並確認行程真的結束了。
+
+        實測 Close() 會讓 AspenPlus.exe 一起結束，所以正常路徑不會留下
+        孤兒。會留下的是異常路徑：Aspen 自己掛掉、或這支程式被砍時來不及
+        走到這裡。那些殘留會鎖住 .bkp，下一次 open_project 就報
+        「Unable to open file」，而錯誤訊息完全看不出原因。
+
+        所以這裡多做一件事：Close() 之後回頭確認自己那個行程編號真的
+        不在了。還在就把它收掉 —— 收的是自己開的那一份，不會動到使用者
+        自己開著的 Aspen 視窗。
+        """
+        pid = self._pid
         if self.app is not None:
             try:
                 self.app.Close()
@@ -205,7 +286,12 @@ class Bridge:
                 pass
             self.app = None
         self._ui_cache.clear()
-        return _ok()
+        self._pid = None
+        leftover = False
+        if pid and _pid_alive(pid):
+            leftover = True
+            _kill_pid(pid)
+        return _ok({"pid": pid, "had_to_force_close": leftover})
 
     # 應用層級的 COM 屬性。原本有一個專用的 show_gui，但那把「要不要開 GUI」
     # 這個決定寫死在本地。改成通用讀寫後，決定權回到雲端，動作數也沒增加。
