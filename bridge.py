@@ -88,9 +88,68 @@ def _written(before: dict, after: dict) -> list:
                   if before.get(name) != ts)
 
 
+# 有幾個錯誤碼在程式裡被丟出來的地方太多，逐一寫訊息一定會漏。實測結果
+# 是呼叫端收到「NOT_CONNECTED: 」—— 一個冒號後面什麼都沒有，看不出要做
+# 什麼。這裡給預設值，呼叫點自己有話講時不會被蓋掉。
+_DEFAULT_DETAIL = {
+    "NOT_CONNECTED": "目前沒有連著的 Aspen。先用 open_project 開檔，"
+                     "或用 new_project 建一個空白專案。",
+}
+
+
 def _err(code: str, detail: str = "") -> dict:
+    text = str(detail)[:500]
+    if not text.strip():
+        text = _DEFAULT_DETAIL.get(code, text)
     return {"ok": False, "data": None,
-            "error": {"code": code, "detail": str(detail)[:500]}}
+            "error": {"code": code, "detail": text}}
+
+
+# ── 有沒有可以操作的桌面 ────────────────────────────────────────────
+# UI 自動化（電解質精靈、經濟分析）要有一個真的在渲染的桌面。遠端連線
+# 中斷、或畫面鎖住時，視窗還在、行程還活著，但 UIA 找不到任何控制項。
+# 實測：這種狀態下精靈十次全敗，每次 5–51 秒，錯誤訊息只說「找不到某個
+# 下拉選單」，完全沒有指向真正的原因。先問一句就能省掉這些。
+def _interactive_desktop() -> tuple:
+    """(能不能操作桌面, 說明)。查不出來就當作可以，不擋路。"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        # OpenInputDesktop 拿的是「目前正在接收輸入的那個桌面」。
+        # session 被中斷或螢幕鎖住時，這裡就拿不到。
+        handle = user32.OpenInputDesktop(0, False, 0x0001)  # DESKTOP_READOBJECTS
+        if handle:
+            user32.CloseDesktop(handle)
+            return True, "ok"
+        remote = bool(user32.GetSystemMetrics(0x1000))      # SM_REMOTESESSION
+        return False, ("沒有可以操作的桌面：目前這個工作階段沒有在接收輸入"
+                       "（遠端連線已中斷、或畫面鎖住了）。"
+                       "UI 自動化在這種狀態下一定失敗。"
+                       "請把遠端桌面接回來、或在本機解鎖畫面後重試。"
+                       + ("（偵測到這是遠端連線工作階段）" if remote else ""))
+    except Exception:
+        return True, "檢查不出來，當作可以用"
+
+
+# 開檔最多試幾次、每次之間等多久。模組層級的常數，測試可以蓋掉。
+_OPEN_ATTEMPTS = 3
+_RETRY_SLEEP = 3.0
+
+
+def _build_typelib(app) -> str | None:
+    """把 early-bound 型別庫建起來（相當於手動跑 makepy）。
+
+    WithEvents 要有型別庫才掛得上去。快取沒建、或被建壞的時候（這個專案
+    遇過 0 byte 的損毀檔），會丟「This COM object can not automate the
+    makepy process」。這不是橋接程式版本舊，重連 MCP 也不會變好 ——
+    要真的去把型別庫生出來。成功回 None，失敗回原因。
+    """
+    try:
+        from win32com.client import gencache
+        gencache.EnsureDispatch(app)
+        return None
+    except Exception as exc:
+        return repr(exc)[:200]
 
 
 # ── 殘留的 Aspen 行程 ───────────────────────────────────────────────
@@ -293,12 +352,25 @@ class Bridge:
                     "目錄在，但沒有這個檔名（大小寫與副檔名 .bkp/.apw/.apwz 都要對）")
             return _err("FILE_NOT_FOUND",
                         self._open_failure("找不到檔案：{}（{}）".format(path, hint)))
-        try:
-            getattr(self.app, loader)(path)
-            self._path = path
-            return _ok({"path": path, "loader": loader})
-        except Exception as exc:
-            return _err("COM_ERROR", self._open_failure(repr(exc)))
+        # 開檔會間歇性失敗（「Unable to open file」2041），同一個檔案等幾秒
+        # 再開就成功 —— 實測重試 100% 恢復。這是少數該由橋接層自己處理的
+        # 重試：檔案存在性已經確認過，剩下的是 Aspen 自己還沒準備好。
+        # 回報試了幾次，免得真的壞掉時被這層重試遮住。
+        last = None
+        for attempt in range(1, _OPEN_ATTEMPTS + 1):
+            try:
+                getattr(self.app, loader)(path)
+                self._path = path
+                data = {"path": path, "loader": loader}
+                if attempt > 1:
+                    data["attempts"] = attempt
+                return _ok(data)
+            except Exception as exc:
+                last = exc
+                if attempt < _OPEN_ATTEMPTS:
+                    time.sleep(_RETRY_SLEEP)
+        return _err("COM_ERROR", "{}（已重試 {} 次）".format(
+            self._open_failure(repr(last)), _OPEN_ATTEMPTS))
 
     def _open_failure(self, detail: str) -> str:
         """開檔失敗時，把能查到的線索一起帶回去。
@@ -812,11 +884,28 @@ class Bridge:
             self._cp_handler.sink = self._cp_messages
             self._cp_capture = "ok"
         except Exception as exc:
-            # WithEvents 需要 early-bound 型別庫（makepy）。這一步失敗不該
-            # 拖垮執行本身 —— 引擎照跑，只是拿不到 Control Panel 原話，
-            # 要把「拿不到」講出來，不能默默當成沒有訊息。
+            # WithEvents 需要 early-bound 型別庫（makepy）。快取沒建起來時
+            # 就是掛在這裡。先自己把型別庫生出來再試一次 —— 這是能當場修好
+            # 的事，沒道理讓學生整場拿不到 Control Panel 訊息。
+            build_err = _build_typelib(self.app)
             self._cp_handler = None
             self._cp_capture = "unavailable: " + repr(exc)[:200]
+            if build_err is None:
+                try:
+                    self._cp_handler = win32.WithEvents(self.app,
+                                                        _ControlPanelEvents)
+                    self._cp_handler.sink = self._cp_messages
+                    self._cp_capture = "ok"
+                except Exception as again:
+                    self._cp_handler = None
+                    self._cp_capture = ("unavailable: 型別庫(makepy)已重建，"
+                                        "但監聽仍掛不上：" + repr(again)[:160])
+            else:
+                # 這一步失敗不該拖垮執行本身 —— 引擎照跑，只是拿不到
+                # Control Panel 原話，要把「拿不到」講出來，不能默默
+                # 當成沒有訊息。
+                self._cp_capture = ("unavailable: 型別庫(makepy)建不起來："
+                                    + build_err)
 
         def _worker():
             pythoncom.CoInitialize()
@@ -1049,6 +1138,9 @@ class Bridge:
         重新掃。精靈開起來之後，所有搜尋都應該限定在精靈視窗內 ——
         全域搜尋不只慢，還會找到主視窗上同名的東西。
         """
+        ok, why = _interactive_desktop()
+        if not ok:
+            return _err("NO_INTERACTIVE_DESKTOP", why)
         try:
             self._auto()
         except ImportError as exc:
@@ -1094,6 +1186,9 @@ class Bridge:
         root_id／root_name 限定搜尋範圍。精靈開起來後一定要限定在精靈視窗內，
         否則會找到主視窗上同名的控制項。
         """
+        ok, why = _interactive_desktop()
+        if not ok:
+            return _err("NO_INTERACTIVE_DESKTOP", why)
         try:
             auto = self._auto()
         except ImportError as exc:
@@ -1149,6 +1244,9 @@ class Bridge:
     # 雲端要退回路徑時，用 batch 的 first_success 模式一次把整串送下來。
     def ui_act(self, control_id: str, action: str,
                text: str | None = None) -> dict:
+        ok, why = _interactive_desktop()
+        if not ok:
+            return _err("NO_INTERACTIVE_DESKTOP", why)
         ctrl = self._ui_cache.get(control_id)
         if ctrl is None:
             return _err("UI_NOT_FOUND", control_id)
