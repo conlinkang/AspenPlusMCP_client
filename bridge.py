@@ -100,13 +100,18 @@ def _err(code: str, detail: str = "") -> dict:
 def _aspen_pids() -> list:
     """目前機器上所有 AspenPlus.exe 的行程編號。查不到就回空清單。"""
     try:
+        # 不用 text=True：tasklist 的輸出是主控台編碼（中文 Windows 是
+        # cp950），學生若設了 PYTHONUTF8=1 就會在讀取執行緒裡炸
+        # UnicodeDecodeError，然後這裡回空清單 —— 「沒有殘留行程」變成假話。
+        # 行程編號是 ASCII，用 replace 解碼就夠。
         out = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq AspenPlus.exe", "/NH", "/FO",
-             "CSV"], capture_output=True, text=True, timeout=15)
+             "CSV"], capture_output=True, timeout=15)
     except Exception:
         return []
     pids = []
-    for line in (out.stdout or "").splitlines():
+    text = (out.stdout or b"").decode("utf-8", errors="replace")
+    for line in text.splitlines():
         parts = [p.strip('"') for p in line.split('","')]
         if len(parts) >= 2 and parts[0].lower().startswith("aspenplus"):
             try:
@@ -114,6 +119,27 @@ def _aspen_pids() -> list:
             except ValueError:
                 pass
     return pids
+
+
+def _locked_by(path: str) -> str | None:
+    """檔案被別的行程開著就回一句說明，沒有就回 None。
+
+    Windows 下 Aspen 開著的 .bkp 會被獨佔；最常見的兇手是殘留的
+    AspenPlus.exe。試著以寫入模式開一下，開不了就是被鎖。
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r+b"):
+            return None
+    except PermissionError:
+        others = _aspen_pids()
+        tail = (" 目前還有 {} 個 AspenPlus.exe 在跑（PID {}），很可能就是它們。"
+                .format(len(others), "、".join(str(p) for p in others))
+                if others else "")
+        return "檔案被別的程式開著，無法寫入：{}。{}".format(path, tail)
+    except OSError:
+        return None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -128,6 +154,41 @@ def _kill_pid(pid: int) -> None:
         pass
 
 
+# Control Panel 訊息最多留這麼多行。一次長模擬可能吐上萬行，全留著會把
+# 記憶體和回傳都撐爆；真正有用的是最後那一段和「TERMINAL ERROR」那幾行。
+CP_MAX_LINES = 4000
+
+
+class _ControlPanelEvents:
+    """接 Aspen 的 OnControlPanelMessage 事件，把每一行收進 sink。
+
+    WithEvents 會自己 new 這個類別（不能帶參數），所以 sink 事後才掛上去。
+    收到的是 Aspen 在 Control Panel 視窗裡講的原話 —— 「NO COMPONENTS HAVE
+    BEEN DEFINED」「SIMULATION WILL NOT BE EXECUTED」這種。這些話**不會**
+    出現在 Run-Status 節點或 history 檔裡：輸入被拒絕時 Aspen 連 Run-Status
+    都不建，事後去讀什麼都讀不到。只有事件當下接住才拿得到。
+    """
+
+    def __init__(self):
+        self.sink = None
+
+    def OnControlPanelMessage(self, clear, msg):
+        sink = self.sink
+        if sink is None:
+            return
+        try:
+            if clear:
+                sink.append("[CONTROL PANEL CLEARED]")
+            if msg is not None:
+                text = str(msg).rstrip()
+                if text.strip():
+                    sink.append(text)
+            if len(sink) > CP_MAX_LINES:
+                del sink[:len(sink) - CP_MAX_LINES]
+        except Exception:
+            pass
+
+
 class Bridge:
     """20 個通用動作。不含業務邏輯。"""
 
@@ -139,6 +200,9 @@ class Bridge:
         self._run_error: str | None = None
         self._path: str | None = None      # 目前開著的檔，用來找 history 檔
         self._pid: int | None = None       # 自己這一份 Aspen 的行程編號
+        self._cp_messages: list = []        # 這一次執行的 Control Panel 原話
+        self._cp_handler = None             # WithEvents 的事件物件，跑完就放掉
+        self._cp_capture: str = "not_started"
         self.op_count = 0
 
     # ══ 連線與檔案 ══════════════════════════════════════════════════
@@ -172,13 +236,41 @@ class Bridge:
             return _err("COM_ERROR", repr(exc))
 
     def create_file(self) -> dict:
+        """開一個空白模型（File → New）。
+
+        InitNew2() 只在這一份 Aspen 還沒開過模型時有用。已經開著模型再叫
+        它，實測丟 com_error 2001「Unexpected Error」—— 舊 MCP 把這個
+        例外吞掉回 False，呼叫端沒檢查，於是「新專案」其實是原來那個
+        模型繼續用，後面加的元件、反應全疊在舊模型上。而 app.Close() 只會
+        把 COM 連線切斷、行程留著（實測），也救不回來。
+
+        唯一可靠的做法是換一份新的 Aspen：關掉自己這一份（close() 會確認
+        行程真的結束）、再 Dispatch 一份，然後 InitNew2。回傳裡講清楚有
+        沒有換過行程、前一個模型的路徑是什麼 —— 那個模型是連存都沒存就
+        關掉的，雲端要把這件事告訴使用者。
+        """
         if self.app is None:
             return _err("NOT_CONNECTED")
         try:
             self.app.InitNew2()
-            return _ok()
-        except Exception as exc:
-            return _err("COM_ERROR", repr(exc))
+            self._path = None
+            return _ok({"recycled": False, "pid": self._pid})
+        except Exception as first:
+            previous_path, old_pid = self._path, self._pid
+            closed = self.close()
+            reconnected = self.connect()
+            if not reconnected.get("ok"):
+                return _err("COM_ERROR",
+                            "InitNew2 失敗（{}），重開 Aspen 也失敗：{}".format(
+                                repr(first), reconnected.get("error")))
+            try:
+                self.app.InitNew2()
+            except Exception as second:
+                return _err("COM_ERROR", "重開一份 Aspen 之後 InitNew2 仍失敗：{}".format(repr(second)))
+            self._path = None
+            return _ok({"recycled": True, "pid": self._pid, "previous_pid": old_pid,
+                        "previous_path": previous_path,
+                        "previous_had_to_force_close": (closed.get("data") or {}).get("had_to_force_close")})
 
     def open_file(self, path: str, mode: str = "archive") -> dict:
         """開檔。mode 決定用哪個 COM 方法，由雲端指定，橋接層不替它選。
@@ -195,6 +287,12 @@ class Bridge:
         loader = {"archive": "InitFromArchive", "file": "InitFromFile2"}.get(mode)
         if loader is None:
             return _err("BAD_ARG", "mode 只能是 archive 或 file")
+        if not os.path.isfile(path):
+            folder = os.path.dirname(os.path.abspath(path))
+            hint = ("目錄也不存在" if not os.path.isdir(folder) else
+                    "目錄在，但沒有這個檔名（大小寫與副檔名 .bkp/.apw/.apwz 都要對）")
+            return _err("FILE_NOT_FOUND",
+                        self._open_failure("找不到檔案：{}（{}）".format(path, hint)))
         try:
             getattr(self.app, loader)(path)
             self._path = path
@@ -243,6 +341,20 @@ class Bridge:
         """
         if self.app is None:
             return _err("NOT_CONNECTED")
+        # 目錄不存在時 Aspen 只回「Aspen.Unknown No message available」，
+        # 檔被別人開著時回「Unable to open file」——兩個都看不出原因，
+        # 但兩個都能在丟給 COM 之前查出來。
+        if path:
+            folder = os.path.dirname(os.path.abspath(path))
+            if not os.path.isdir(folder):
+                return _err("DIR_NOT_FOUND",
+                            "目錄不存在：{}。先建立目錄，或改存到既有的資料夾。"
+                            .format(folder))
+            if os.path.exists(path) and not os.access(path, os.W_OK):
+                return _err("FILE_READONLY", "檔案是唯讀的：{}".format(path))
+            locked = _locked_by(path)
+            if locked:
+                return _err("FILE_LOCKED", locked)
         try:
             if export_type is not None:
                 if not path:
@@ -279,6 +391,7 @@ class Bridge:
         自己開著的 Aspen 視窗。
         """
         pid = self._pid
+        self._detach_control_panel()
         if self.app is not None:
             try:
                 self.app.Close()
@@ -689,6 +802,22 @@ class Bridge:
         self._run_done = threading.Event()
         self._run_started = time.monotonic()
 
+        # 監聽要掛在主執行緒 —— 連接點屬於建立 COM 物件的 apartment，
+        # 事件也是在主執行緒 PumpWaitingMessages() 時送達。工作執行緒
+        # 只負責喊 Run2()，不碰事件。
+        self._cp_messages = []
+        self._detach_control_panel()
+        try:
+            self._cp_handler = win32.WithEvents(self.app, _ControlPanelEvents)
+            self._cp_handler.sink = self._cp_messages
+            self._cp_capture = "ok"
+        except Exception as exc:
+            # WithEvents 需要 early-bound 型別庫（makepy）。這一步失敗不該
+            # 拖垮執行本身 —— 引擎照跑，只是拿不到 Control Panel 原話，
+            # 要把「拿不到」講出來，不能默默當成沒有訊息。
+            self._cp_handler = None
+            self._cp_capture = "unavailable: " + repr(exc)[:200]
+
         def _worker():
             pythoncom.CoInitialize()
             app = None
@@ -731,16 +860,37 @@ class Bridge:
             pythoncom.PumpWaitingMessages()
             if self._run_done.is_set():
                 elapsed = round(time.monotonic() - self._run_started, 1)
+                # 引擎結束後尾端還有幾行在佇列裡，再抽幾次才收得齊。
+                for _ in range(10):
+                    pythoncom.PumpWaitingMessages()
+                    time.sleep(0.02)
+                self._detach_control_panel()
+                extra = {"control_panel": list(self._cp_messages),
+                         "control_panel_capture": self._cp_capture}
                 if self._run_error:
                     return _ok({"status": "failed", "completed": True,
-                                "detail": self._run_error, "elapsed_s": elapsed})
+                                "detail": self._run_error, "elapsed_s": elapsed,
+                                **extra})
                 return _ok({"status": "completed", "completed": True,
-                            "elapsed_s": elapsed})
+                            "elapsed_s": elapsed, **extra})
             if time.monotonic() >= deadline:
                 return _ok({"status": "running", "completed": False,
                             "elapsed_s": round(
                                 time.monotonic() - self._run_started, 1)})
             self._run_done.wait(0.25)
+
+    def _detach_control_panel(self) -> None:
+        """放掉事件物件。留著會持有 COM 參考，關檔時可能卡住。"""
+        handler, self._cp_handler = self._cp_handler, None
+        if handler is None:
+            return
+        try:
+            handler.sink = None
+            close = getattr(handler, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
 
     def reinit(self) -> dict:
         if self.app is None:
@@ -765,7 +915,9 @@ class Bridge:
         if self.app is None:
             return _err("NOT_CONNECTED")
         out: dict = {"run_status_exists": False, "text": "",
-                     "history": "", "errors": []}
+                     "history": "", "errors": [],
+                     "control_panel": list(self._cp_messages),
+                     "control_panel_capture": self._cp_capture}
         try:
             node = self.app.Tree.FindNode(
                 r"\Data\Results Summary\Run-Status\Output\PER_ERROR")

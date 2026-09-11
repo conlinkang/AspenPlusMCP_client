@@ -12,9 +12,11 @@
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -28,14 +30,38 @@ MAX_ROUNDS = 500         # 防止雲端邏輯有 bug 時無限迴圈
                          # 執行一次模擬會輪詢數十次，上限不能訂得比它低
 
 
+# 雲端重啟中的那幾秒，TCP 會直接拒絕（WinError 10061）。以前一次拒絕就
+# 整個工具呼叫失敗，而且訊息只有一串 errno；重啟是常態，不該讓學生端
+# 為此整場崩掉。這裡短暫重試，仍然連不上再清楚地講出來。
+RETRY_S = (0.5, 1.0, 2.0, 3.0, 5.0)
+
+
 def post(path: str, payload: dict, timeout: float = 60.0) -> dict:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         CLOUD + path, data=body,
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + TOKEN})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    last = None
+    for wait in RETRY_S + (None,):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            refused = (isinstance(reason, ConnectionRefusedError)
+                       or "10061" in str(reason)
+                       or "refused" in str(reason).lower())
+            if not refused or wait is None:
+                if refused:
+                    raise ConnectionError(
+                        "連不上雲端 {}：連線被拒絕，已重試 {} 秒。伺服器可能"
+                        "沒在跑或正在重啟；請稍後再試，或請管理者確認 8787 "
+                        "有在監聽。".format(CLOUD, int(sum(RETRY_S)))) from exc
+                raise
+            last = exc
+            time.sleep(wait)
+    raise last  # 理論上到不了這裡
 
 
 class Agent:
@@ -44,6 +70,9 @@ class Agent:
         self.session = uuid.uuid4().hex[:12]
         self.rounds = 0
         self.ops_sent = 0
+        # 這支程式被 Claude Desktop 收掉時沒有人會呼叫 close_project，
+        # 那一份 AspenPlus.exe 就留下來鎖著 .bkp。行程結束前補一次關閉。
+        atexit.register(self.shutdown)
 
     def list_tools(self) -> list:
         """工具清單從雲端來，不寫死在本地。
@@ -74,7 +103,10 @@ class Agent:
         return reply.get("result", {})
 
     def shutdown(self) -> None:
-        self.bridge.execute("close")
+        try:
+            self.bridge.execute("close")
+        except Exception:
+            pass
 
 
 # ── MCP stdio server ────────────────────────────────────────────────

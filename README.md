@@ -141,6 +141,21 @@ python setup_student.py --check
 
 ---
 
+## 之後怎麼更新
+
+`bridge.py` 和 `agent.py` 會隨著課程修正而更新（例如 2026-09-11 起，
+`run_simulation` 會把 Aspen Control Panel 的訊息一起帶回來，這需要新版的
+`bridge.py`）。管理者通知有新版時：
+
+1. 重新下載這三個檔案，蓋掉原來的（或在資料夾裡 `git pull`）。
+2. **完全關閉再重開 Claude Desktop** —— `agent.py` 是 Claude 啟動時載入的，
+   不重開不會換到新版。
+
+工具回覆裡若出現 `control_panel_capture` 不是 `ok`、或 `note` 說「橋接程式
+是舊版」，就是還沒更新到新版。
+
+---
+
 ## 疑難排解
 
 | 安裝程式回報 | 原因 / 怎麼處理 |
