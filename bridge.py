@@ -135,6 +135,9 @@ def _interactive_desktop() -> tuple:
 _OPEN_ATTEMPTS = 3
 _RETRY_SLEEP = 3.0
 
+# 送出停止要求之後，最多等引擎幾秒才承認它沒停下來。
+STOP_WAIT_S = 10.0
+
 
 def _build_typelib(app) -> str | None:
     """把 early-bound 型別庫建起來（相當於手動跑 makepy）。
@@ -859,11 +862,34 @@ class Bridge:
         try:
             if action == "stop":
                 self.app.Engine.Stop()
-                return _ok({"status": "stopping"})
+                # Stop() 只是「請求」停止 —— 要等工作執行緒裡的 Run2()
+                # 真的返回，_run_done 才會被設起來。不等的話，呼叫端以為
+                # 停好了，下一次 start 卻一直撞 ALREADY_RUNNING，而且看不出
+                # 為什麼（實測經濟分析逾時後就是卡在這裡，最後只能殺行程）。
+                stopped = True
+                if self._run_done is not None:
+                    stopped = self._run_done.wait(STOP_WAIT_S)
+                return _ok({"status": "stopped" if stopped else "still_running",
+                            "stopped": stopped,
+                            "waited_s": 0 if stopped else STOP_WAIT_S,
+                            "detail": None if stopped else
+                            "已經送出停止要求，但引擎在 {:.0f} 秒內沒有停下來。"
+                            "這一份 Aspen 不能再啟動新的執行了 —— 先用 "
+                            "close_project 關掉再重開，或直接換一份。"
+                            .format(STOP_WAIT_S)})
             if action != "start":
                 return _err("BAD_ARG", "action 只能是 start 或 stop")
             if self._run_done is not None and not self._run_done.is_set():
-                return _err("ALREADY_RUNNING")
+                running_for = (time.monotonic() - (self._run_started or 0)
+                               if self._run_started else None)
+                return _err("ALREADY_RUNNING",
+                            "這一份 Aspen 還有一次執行沒有結束{}。"
+                            "同時跑兩次會讓兩邊都拿不到正確結果。"
+                            "先用 run(action='stop') 停掉；若停不下來，"
+                            "那次執行已經卡死在引擎裡，close_project 再重開"
+                            "是唯一的出路。".format(
+                                "（已經跑了 {:.0f} 秒）".format(running_for)
+                                if running_for else ""))
 
             stream = pythoncom.CoMarshalInterThreadInterfaceInStream(
                 pythoncom.IID_IDispatch, self.app)
