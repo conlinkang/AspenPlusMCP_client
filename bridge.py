@@ -714,7 +714,19 @@ class Bridge:
     }
 
     def _record(self, node, detail: str) -> dict | None:
-        """把一個節點壓成純資料。detail="value" 只取值，"full" 取全部屬性。"""
+        """把一個節點壓成純資料。
+
+        detail="status" 只取完成度狀態，"value" 只取值，"full" 取全部屬性。
+        """
+        if detail == "status":
+            # 只問一個屬性。沒有狀態的節點（純資料欄位）直接略過 ——
+            # 一棵樹兩三萬個節點裡帶狀態的只有兩三百個。
+            try:
+                code = node.AttributeValue(self._ATTRS["compstatus"])
+            except Exception:
+                return None
+            return None if code is None else {"compstatus": code}
+
         try:
             value = node.Value
         except Exception:
@@ -761,18 +773,21 @@ class Bridge:
                 detail: str = "value") -> dict:
         """一次取回整個子樹。
 
-        detail="value" 只回傳有值的節點（最省）。
-        detail="full"  回傳每個節點的完整屬性紀錄，讓雲端不必為了問
-                       「這欄位可不可輸入／說明是什麼／單位類別為何」
-                       再往返一次。原本的 _traverse_elements 在本地逐節點問了
-                       這些屬性；搬到雲端後那會變成上千次往返，所以必須一次帶回。
+        detail="status" 只回傳帶完成度狀態（compstatus）的節點。給「整棵樹
+                        哪裡沒設完」這種檢查用：實測 C10 全樹 20,393 個節點，
+                        full 要 55.6 秒、status 只要 10.8 秒，判斷結果相同。
+        detail="value"  只回傳有值的節點。
+        detail="full"   回傳每個節點的完整屬性紀錄，讓雲端不必為了問
+                        「這欄位可不可輸入／說明是什麼／單位類別為何」
+                        再往返一次。原本的 _traverse_elements 在本地逐節點問了
+                        這些屬性；搬到雲端後那會變成上千次往返，所以必須一次帶回。
 
         實測：單一區塊 Input 底下有 1,266 個節點，全模型 5,056 個。
         逐項往返在校內網路要 54.6 秒，一次 subtree 只要 4.1 秒。
         批次不是最佳化，是可行性前提。
         """
-        if detail not in ("value", "full"):
-            return _err("BAD_ARG", "detail 只能是 value 或 full")
+        if detail not in ("status", "value", "full"):
+            return _err("BAD_ARG", "detail 只能是 status、value 或 full")
         try:
             root = self._node(path)
         except BridgeError as exc:
