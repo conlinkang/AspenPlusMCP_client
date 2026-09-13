@@ -1486,6 +1486,24 @@ class Bridge:
                                            for m, p_ in latest[:5]]})
             time.sleep(0.2)
 
+    def fs_list(self, pattern: str, limit: int = 20) -> dict:
+        """列出符合 pattern 的檔案，新的在前（限 AspenTech 工作區）。"""
+        expanded = os.path.expandvars(pattern)
+        if not self._fs_allowed(os.path.dirname(expanded.split("*")[0]) or expanded):
+            return _err("FS_FORBIDDEN", "只允許 %LOCALAPPDATA%\\AspenTech 底下的路徑")
+        files = []
+        for path in glob.glob(expanded):
+            if not self._fs_allowed(path) or not os.path.isfile(path):
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            files.append({"path": path, "mtime": st.st_mtime, "size": st.st_size})
+        files.sort(key=lambda f: f["mtime"], reverse=True)
+        return _ok({"files": files[:max(1, min(int(limit), 200))],
+                    "total": len(files)})
+
     def fs_read_text(self, path: str, max_bytes: int = 400000,
                      encoding: str = "cp1252") -> dict:
         """讀一個文字檔（限 AspenTech 工作區）。APEA 的報表是 cp1252。"""
@@ -1602,7 +1620,7 @@ class Bridge:
         "row",
         "run", "run_status", "reinit", "get_log",
         "ui_tree", "ui_find", "ui_wait", "ui_act", "sleep", "read_table",
-        "clock", "fs_wait", "fs_read_text",
+        "clock", "fs_wait", "fs_list", "fs_read_text",
     )
 
     def execute(self, op: str, args: dict | None = None) -> dict:
