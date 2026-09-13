@@ -982,6 +982,9 @@ class Bridge:
                 self._detach_control_panel()
                 extra = {"control_panel": list(self._cp_messages),
                          "control_panel_capture": self._cp_capture}
+                # finished_at 用本機時鐘。雲端和學生電腦的時鐘不同步，
+                # 「比引擎結束還新的檔案」只能拿本機時間比。
+                extra["finished_at"] = time.time()
                 if self._run_error:
                     return _ok({"status": "failed", "completed": True,
                                 "detail": self._run_error, "elapsed_s": elapsed,
@@ -1412,6 +1415,91 @@ class Bridge:
                 pass
         return out
 
+    # ══ 檔案系統（只限 AspenTech 工作區）═══════════════════════════════
+    # 經濟評估算完沒有 COM 訊號，但 APEA 會在本機工作區寫出報表檔。
+    # 雲端要看那些檔，只能透過這裡 —— 所以範圍鎖死在 %LOCALAPPDATA%\AspenTech，
+    # 雲端不能藉這幾個 op 讀學生電腦上的其他東西。
+
+    @staticmethod
+    def _fs_roots() -> list:
+        base = os.environ.get("LOCALAPPDATA") or ""
+        return [os.path.normcase(os.path.realpath(os.path.join(base, "AspenTech")))] if base else []
+
+    def _fs_allowed(self, path: str) -> bool:
+        real = os.path.normcase(os.path.realpath(path))
+        return any(real == root or real.startswith(root + os.sep)
+                   for root in self._fs_roots())
+
+    def clock(self) -> dict:
+        """本機時間。雲端要拿「點下按鈕那一刻」跟檔案時間比，就先問這個。"""
+        return _ok({"now": time.time()})
+
+    def fs_wait(self, pattern: str, newer_than: float, quiet_s: float = 1.0,
+                timeout_s: float = 20.0) -> dict:
+        """等一個符合 pattern 的檔案：修改時間比 newer_than 新，而且它所在的
+        目錄已經連續 quiet_s 秒沒有新寫入（代表那一批檔寫完了）。
+
+        pattern 可以含環境變數與萬用字元。等待放在本地，理由和 run_status
+        一樣：雲端每秒問一次會是幾十趟往返。等多久由雲端決定。
+        """
+        roots = self._fs_roots()
+        if not roots:
+            return _err("FS_UNAVAILABLE", "找不到 LOCALAPPDATA")
+        expanded = os.path.expandvars(pattern)
+        if not self._fs_allowed(os.path.dirname(expanded.split("*")[0]) or expanded):
+            return _err("FS_FORBIDDEN", "只允許 %LOCALAPPDATA%\\AspenTech 底下的路徑")
+        start = time.monotonic()
+        timeout_s = max(0.0, min(float(timeout_s), 50.0))
+        newer_than = float(newer_than)
+        latest: list = []
+        while True:
+            latest = []
+            for path in glob.glob(expanded):
+                if not self._fs_allowed(path):
+                    continue
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                latest.append((mtime, path))
+                if mtime <= newer_than:
+                    continue
+                folder = os.path.dirname(path)
+                newest = mtime
+                try:
+                    for entry in os.scandir(folder):
+                        try:
+                            newest = max(newest, entry.stat().st_mtime)
+                        except OSError:
+                            pass
+                except OSError:
+                    continue
+                if time.time() - newest >= quiet_s:
+                    return _ok({"found": True, "path": path, "dir": folder,
+                                "mtime": mtime, "after_s": round(mtime - newer_than, 2),
+                                "waited_s": round(time.monotonic() - start, 2)})
+            if time.monotonic() - start >= timeout_s:
+                latest.sort(reverse=True)
+                return _ok({"found": False,
+                            "waited_s": round(time.monotonic() - start, 2),
+                            "candidates": [{"path": p_, "age_vs_baseline_s": round(m - newer_than, 1)}
+                                           for m, p_ in latest[:5]]})
+            time.sleep(0.2)
+
+    def fs_read_text(self, path: str, max_bytes: int = 400000,
+                     encoding: str = "cp1252") -> dict:
+        """讀一個文字檔（限 AspenTech 工作區）。APEA 的報表是 cp1252。"""
+        expanded = os.path.expandvars(path)
+        if not self._fs_allowed(expanded):
+            return _err("FS_FORBIDDEN", "只允許 %LOCALAPPDATA%\\AspenTech 底下的路徑")
+        if not os.path.isfile(expanded):
+            return _err("FILE_NOT_FOUND", expanded)
+        size = os.path.getsize(expanded)
+        with open(expanded, "rb") as fh:
+            raw = fh.read(max(0, min(int(max_bytes), 2000000)))
+        return _ok({"path": expanded, "size": size, "truncated": size > len(raw),
+                    "text": raw.decode(encoding, errors="replace")})
+
     def read_table(self, path: str, sheet: str | None = None,
                    max_rows: int = 400, max_cols: int = 40,
                    open_timeout_s: float = 20.0) -> dict:
@@ -1514,6 +1602,7 @@ class Bridge:
         "row",
         "run", "run_status", "reinit", "get_log",
         "ui_tree", "ui_find", "ui_wait", "ui_act", "sleep", "read_table",
+        "clock", "fs_wait", "fs_read_text",
     )
 
     def execute(self, op: str, args: dict | None = None) -> dict:
