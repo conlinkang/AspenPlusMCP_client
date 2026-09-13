@@ -1,0 +1,10 @@
+# 三個檔案（agent.py / bridge.py / setup_student.py）合起來要的套件。
+# 版本是課程機房 D:\Aspen_MCP\.venv 裡實測可用的那一組，下限抓寬一點
+# 避免擋到別的環境裡已經裝好、稍舊但一樣能動的版本。
+#
+#   python -m pip install -r requirements.txt
+
+mcp>=1.0.0
+pywin32>=306
+uiautomation>=2.0.18
+openpyxl>=3.1.0

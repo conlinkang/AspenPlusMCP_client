@@ -2,13 +2,14 @@
 
 讓 Claude Desktop 能操作你電腦上的 Aspen Plus，透過課程的雲端伺服器取得工具邏輯。
 
-這個資料夾只有三個檔案，就是完整的本地端：
+這個資料夾就是完整的本地端：
 
 | 檔案 | 做什麼 |
 |---|---|
 | `agent.py` | 跟 Claude Desktop 對話的 MCP 伺服器，把工具呼叫轉發給雲端 |
 | `bridge.py` | 讀寫你電腦上 Aspen Plus 的資料節點 |
 | `setup_student.py` | 安裝程式：檢查環境、測連線、寫入 Claude Desktop 設定 |
+| `requirements.txt` | 上面三個檔案要用的 Python 套件清單 |
 
 不含任何工具邏輯（怎麼判斷收斂、怎麼設定反應、怎麼跑經濟分析……）——
 那些都在雲端伺服器上執行，這裡只負責「转发」跟「操作 Aspen」。
@@ -24,9 +25,11 @@
 ## 前置需求
 
 - 這台電腦已經安裝 **Aspen Plus** 並且授權可以正常開啟
-- 一個裝了 `pywin32` 與 `mcp` 套件的 Python（課程機房的 Aspen 環境
-  通常已經有，例如 `D:\Aspen_MCP\.venv\Scripts\python.exe`；如果沒有，
-  自己找個 Python 裝：`python -m pip install pywin32 mcp`）
+- 一個裝了 `requirements.txt` 裡那些套件的 Python（`pywin32`、`mcp`、
+  `uiautomation`、`openpyxl`）——課程機房的 Aspen 環境通常已經有，
+  例如 `D:\Aspen_MCP\.venv\Scripts\python.exe`；如果沒有，自己找個
+  Python 裝：`python -m pip install -r requirements.txt`
+  （`requirements.txt` 要跟其他三個檔案放同一個資料夾）
 - 已安裝 **Claude Desktop**
 
 ---
@@ -54,15 +57,15 @@
 
 ---
 
-## 步驟二：下載這三個檔案
+## 步驟二：下載這四個檔案
 
 兩種方式擇一：**手動下載**，或是**請你的 AI agent 幫你做**。
 
 ### 方式 A：手動下載
 
-把 `agent.py`、`bridge.py`、`setup_student.py` 三個檔案放進同一個資料夾
-（例如 `D:\AspenPlusMCP_client\`）。三個檔案要放在一起，位置隨意，但
-不能拆開。
+把 `agent.py`、`bridge.py`、`setup_student.py`、`requirements.txt` 四個
+檔案放進同一個資料夾（例如 `D:\AspenPlusMCP_client\`）。四個檔案要放在
+一起，位置隨意，但不能拆開。
 
 ### 方式 B：貼網址給 AI agent 安裝
 
@@ -74,18 +77,20 @@
 請幫我安裝 Aspen Plus MCP 學生端：
 
 1. 從 https://github.com/conlinkang/AspenPlusMCP_client 這個倉庫下載
-   agent.py、bridge.py、setup_student.py 三個檔案（用 git clone，或
-   直接抓這三個 raw 網址都可以：
+   agent.py、bridge.py、setup_student.py、requirements.txt 四個檔案
+   （用 git clone，或直接抓這四個 raw 網址都可以：
    https://raw.githubusercontent.com/conlinkang/AspenPlusMCP_client/master/agent.py
    https://raw.githubusercontent.com/conlinkang/AspenPlusMCP_client/master/bridge.py
    https://raw.githubusercontent.com/conlinkang/AspenPlusMCP_client/master/setup_student.py
-   ），三個檔案放同一個資料夾。
+   https://raw.githubusercontent.com/conlinkang/AspenPlusMCP_client/master/requirements.txt
+   ），四個檔案放同一個資料夾。
 
 2. 執行：
+   python -m pip install -r requirements.txt
    python setup_student.py --url http://192.168.50.113:8787 --token 你的token
 
-3. 如果它回報找不到同時裝有 pywin32 與 mcp 的 Python，先問我要用哪一個
-   直譯器（例如 D:\Aspen_MCP\.venv\Scripts\python.exe），再用
+3. 如果它回報找不到裝齊 requirements.txt 那些套件的 Python，先問我要用
+   哪一個直譯器（例如 D:\Aspen_MCP\.venv\Scripts\python.exe），再用
    --python 那個路徑重新執行，不要自己亂猜或亂裝套件。
 
 4. 執行完告訴我結果，並提醒我要完全關閉再重新打開 Claude Desktop。
@@ -108,15 +113,17 @@
 打開命令提示字元，切到剛剛放檔案的資料夾，執行：
 
 ```bash
+python -m pip install -r requirements.txt
 python setup_student.py --url http://192.168.50.113:8787 --token 你的token
 ```
 
 （如果你的 Aspen 環境不是系統預設的 `python`，可以用 `--python` 指定，
-例如 `--python D:\Aspen_MCP\.venv\Scripts\python.exe`）
+例如 `--python D:\Aspen_MCP\.venv\Scripts\python.exe`；記得 `pip install`
+也要對著同一個直譯器跑）
 
 這支程式會依序做四件事，任何一步失敗都會停下來並說明原因：
 
-1. 找一個同時裝有 `pywin32` 與 `mcp` 的 Python
+1. 找一個裝齊 `requirements.txt` 那些套件的 Python
 2. 測試能不能連到雲端、token 對不對
 3. 測試能不能叫得動這台電腦上的 Aspen
 4. 把設定寫進 Claude Desktop 的設定檔
@@ -160,7 +167,7 @@ python setup_student.py --check
 
 | 安裝程式回報 | 原因 / 怎麼處理 |
 |---|---|
-| 找不到同時裝有 pywin32 與 mcp 的 Python | 用 `--python` 指定正確的直譯器，或在某個環境跑 `pip install pywin32 mcp` |
+| 找不到裝齊 requirements.txt 那些套件的 Python | 用 `--python` 指定正確的直譯器，或在某個環境跑 `pip install -r requirements.txt`（要跟三個 .py 檔同一個資料夾） |
 | 雲端拒絕這組 token | token 打錯字，或帳號已被停權 —— 回 `/status` 用 email 重新查一次，或聯絡課程管理者 |
 | 連不到雲端 | 確認你人在**中正大學**校內網路（目前只開放中正校內，其他學校還沒開放），且網址沒打錯 |
 | 叫不動 Aspen | 這台電腦沒裝 Aspen Plus，或授權沒生效／過期 |

@@ -1,7 +1,8 @@
 """學生端安裝程式。
 
 學生執行這一支，它會：
-  1. 找一個裝了 pywin32 與 mcp 的 Python
+  1. 找一個裝了 requirements.txt 裡那些套件的 Python
+     （pywin32、mcp、uiautomation、openpyxl）
   2. 測試能不能連到雲端、token 對不對
   3. 測試能不能叫得動這台電腦上的 Aspen
   4. 把設定寫進 Claude Desktop 的設定檔
@@ -25,7 +26,7 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-NEEDED = ("win32com", "mcp")
+NEEDED = ("win32com", "mcp", "uiautomation", "openpyxl")
 
 # Claude Desktop 的設定檔位置。Windows 只有這一個。
 CONFIG = (Path(os.environ.get("APPDATA", ""))
@@ -85,10 +86,10 @@ def pick_python(explicit: str | None):
             say(True, "Python：{}".format(python))
             return python, None
         problems.append("{}：缺 {}".format(python, "、".join(missing)))
-    say(False, "找不到同時裝有 pywin32 與 mcp 的 Python",
+    say(False, "找不到裝齊 requirements.txt 那些套件的 Python",
         "\n".join(problems)
-        + "\n\n請在其中一個環境安裝：\n"
-          "    <該 python> -m pip install pywin32 mcp")
+        + "\n\n請在其中一個環境安裝（requirements.txt 跟這支程式同一個資料夾）：\n"
+          "    <該 python> -m pip install -r requirements.txt")
     return None, problems
 
 
