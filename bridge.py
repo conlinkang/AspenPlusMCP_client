@@ -1445,6 +1445,74 @@ class Bridge:
         return any(real == root or real.startswith(root + os.sep)
                    for root in self._fs_roots())
 
+    # ══ 行程狀態（只限 APEA 引擎）═══════════════════════════════════════
+    # 經濟評估不在 AspenPlus.exe 裡算，而是另一個行程 IcarusAdapterExe.exe
+    # （DCOM 啟動）再叫 iccost.exe。實測：點下 Economics Active 後引擎要花
+    # 幾秒初始化，這時送出評估請求會整個遺失，事後沒有任何對話框或錯誤。
+    # 雲端要知道引擎「在不在、閒不閒」才能決定何時送、何時重試。
+    # 只回報這份白名單上的行程 —— 雲端不能拿這個 op 列學生電腦上的其他程式。
+    _WATCHABLE = ("icarusadapterexe.exe", "iccost.exe")
+
+    def proc_status(self, sample_s: float = 0.5) -> dict:
+        """白名單行程有沒有在跑、CPU 多少（取樣 sample_s 秒，單核百分比）。"""
+        import ctypes
+        from ctypes import wintypes
+        import win32process
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        QUERY_LIMITED = 0x1000
+
+        def name_of(handle):
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return os.path.basename(buf.value).lower()
+            return ""
+
+        def times_of(handle):
+            c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+            if not kernel32.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e),
+                                            ctypes.byref(k), ctypes.byref(u)):
+                return None
+            as_int = lambda ft: (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+            return as_int(c), as_int(k) + as_int(u)
+
+        found = {}
+        for pid in win32process.EnumProcesses():
+            handle = kernel32.OpenProcess(QUERY_LIMITED, False, pid)
+            if not handle:
+                continue
+            try:
+                name = name_of(handle)
+                if name in self._WATCHABLE:
+                    t = times_of(handle)
+                    if t:
+                        found[pid] = (name, t[0], t[1])
+            finally:
+                kernel32.CloseHandle(handle)
+
+        sample_s = max(0.1, min(float(sample_s), 3.0))
+        time.sleep(sample_s)
+
+        # FILETIME 是 1601 起算的 100ns
+        now_ft = int((time.time() + 11644473600) * 1e7)
+        out: dict = {n: [] for n in self._WATCHABLE}
+        for pid, (name, created, cpu0) in found.items():
+            handle = kernel32.OpenProcess(QUERY_LIMITED, False, pid)
+            if not handle:
+                continue
+            try:
+                t = times_of(handle)
+            finally:
+                kernel32.CloseHandle(handle)
+            if not t:
+                continue
+            out[name].append({"pid": pid,
+                              "cpu_pct": round((t[1] - cpu0) / 1e7 / sample_s * 100, 1),
+                              "age_s": round((now_ft - created) / 1e7, 1)})
+        return _ok({"processes": out, "sample_s": sample_s})
+
     def clock(self) -> dict:
         """本機時間。雲端要拿「點下按鈕那一刻」跟檔案時間比，就先問這個。"""
         return _ok({"now": time.time()})
@@ -1635,7 +1703,7 @@ class Bridge:
         "row",
         "run", "run_status", "reinit", "get_log",
         "ui_tree", "ui_find", "ui_wait", "ui_act", "sleep", "read_table",
-        "clock", "fs_wait", "fs_list", "fs_read_text",
+        "clock", "fs_wait", "fs_list", "fs_read_text", "proc_status",
     )
 
     def execute(self, op: str, args: dict | None = None) -> dict:
