@@ -251,6 +251,173 @@ class _ControlPanelEvents:
             pass
 
 
+# ── 自動操作中的提示橫幅 ────────────────────────────────────────────
+# UI 自動化會真的移動滑鼠、點按鈕。學生這時候碰滑鼠，點擊就會落到別的
+# 地方，工具失敗而且看不出原因。所以只要在做 UI 動作，就在畫面下方顯示
+# 一條提示。
+#
+# 這條橫幅本身不能干擾自動化，所以：
+#   * 滑鼠可以穿透（WS_EX_TRANSPARENT + HTTRANSPARENT）—— 有些點擊是用
+#     螢幕座標點的，擋到就會點在橫幅上
+#   * 不搶焦點（WS_EX_NOACTIVATE）—— 焦點被拉走，送鍵會打到錯的視窗
+#   * 標題不含 Aspen Plus／Excel —— 工具是用標題找視窗的
+#   * 放畫面下方 —— Aspen 的功能區按鈕在上方
+#   * 自己出任何錯都吞掉，絕不影響 bridge 本身
+# 設環境變數 ASPEN_MCP_BANNER=0 可以關掉。
+BANNER_TEXT = ("Aspen MCP is controlling the screen — "
+               "please do not touch the mouse or keyboard")
+BANNER_TITLE = "MCP automation notice"
+BANNER_CLASS = "AspenMcpUiBanner"
+BANNER_IDLE_S = 6.0          # 流程裡常停 3 秒；太短會一閃一閃
+_UI_OPS = ("ui_find", "ui_wait", "ui_act", "ui_tree")
+
+
+class _UiBanner:
+    WM_APP_SHOW = 0x8000 + 1
+    WM_APP_HIDE = 0x8000 + 2
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._thread = None
+        self._ready = threading.Event()
+        self._hwnd = None
+        self._last = 0.0
+        self._failed = False
+        self._brush = None
+        self._wndproc_ref = None     # 留住參照，避免被回收
+
+    @staticmethod
+    def disabled() -> bool:
+        return os.environ.get("ASPEN_MCP_BANNER", "1").strip() == "0"
+
+    def touch(self) -> None:
+        """有 UI 動作：顯示橫幅（已顯示就延長）。"""
+        if self.disabled() or self._failed:
+            return
+        try:
+            self._last = time.monotonic()
+            if self._thread is None:
+                with self._lock:
+                    if self._thread is None:
+                        self._thread = threading.Thread(
+                            target=self._run, name="ui-banner", daemon=True)
+                        self._thread.start()
+                self._ready.wait(3.0)
+            if self._hwnd:
+                import win32gui
+                win32gui.PostMessage(self._hwnd, self.WM_APP_SHOW, 0, 0)
+        except Exception:
+            pass
+
+    def hide(self) -> None:
+        try:
+            if self._hwnd:
+                import win32gui
+                win32gui.PostMessage(self._hwnd, self.WM_APP_HIDE, 0, 0)
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        try:
+            import ctypes
+            import win32api
+            import win32con
+            import win32gui
+
+            hinst = win32api.GetModuleHandle(None)
+            wc = win32gui.WNDCLASS()
+            wc.lpszClassName = BANNER_CLASS
+            wc.hInstance = hinst
+            wc.lpfnWndProc = self._wndproc
+            # 背景自己在 WM_PAINT 填：pywin32 的 WNDCLASS 不吃 CreateSolidBrush
+            # 回傳的物件，類別筆刷實測是 0，背景根本沒畫，白字就看不見了。
+            self._brush = win32gui.CreateSolidBrush(win32api.RGB(170, 30, 30))
+            self._wndproc_ref = wc.lpfnWndProc
+            try:
+                win32gui.RegisterClass(wc)
+            except win32gui.error:
+                pass                  # 同一個行程裡已經註冊過
+
+            monitor = win32api.MonitorFromPoint((0, 0), 1)   # 主螢幕
+            left, top, right, bottom = win32api.GetMonitorInfo(monitor)["Work"]
+            width = min(980, right - left - 40)
+            height = 46
+            x = left + (right - left - width) // 2
+            y = bottom - height - 20
+
+            ex = (win32con.WS_EX_TOPMOST | win32con.WS_EX_LAYERED
+                  | win32con.WS_EX_TRANSPARENT | win32con.WS_EX_TOOLWINDOW
+                  | 0x08000000)          # WS_EX_NOACTIVATE
+            hwnd = win32gui.CreateWindowEx(ex, BANNER_CLASS, BANNER_TITLE,
+                                           win32con.WS_POPUP, x, y, width, height,
+                                           0, 0, hinst, None)
+            win32gui.SetLayeredWindowAttributes(hwnd, 0, 230, win32con.LWA_ALPHA)
+            ctypes.windll.user32.SetTimer(hwnd, 1, 500, None)
+            self._hwnd = hwnd
+            self._ready.set()
+            win32gui.PumpMessages()
+        except Exception:
+            self._failed = True
+            self._ready.set()
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        import win32con
+        import win32gui
+        try:
+            if msg == self.WM_APP_SHOW:
+                if not win32gui.IsWindowVisible(hwnd):
+                    win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+                win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                                      win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+                                      | win32con.SWP_NOACTIVATE)
+                return 0
+            if msg == self.WM_APP_HIDE:
+                win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+                return 0
+            if msg == win32con.WM_TIMER:
+                if win32gui.IsWindowVisible(hwnd) and \
+                        time.monotonic() - self._last > BANNER_IDLE_S:
+                    win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+                return 0
+            if msg == win32con.WM_NCHITTEST:
+                return -1                # HTTRANSPARENT：點擊穿透到下面的視窗
+            if msg == win32con.WM_MOUSEACTIVATE:
+                return 3                 # MA_NOACTIVATE
+            if msg == win32con.WM_ERASEBKGND:
+                return 1                 # 背景在 WM_PAINT 裡填
+            if msg == win32con.WM_PAINT:
+                import win32api
+                hdc, ps = win32gui.BeginPaint(hwnd)
+                try:
+                    win32gui.FillRect(hdc, win32gui.GetClientRect(hwnd), self._brush)
+                    lf = win32gui.LOGFONT()
+                    lf.lfHeight = -20
+                    lf.lfWeight = 700
+                    lf.lfFaceName = "Segoe UI"
+                    font = win32gui.CreateFontIndirect(lf)
+                    old = win32gui.SelectObject(hdc, font)
+                    win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
+                    win32gui.SetTextColor(hdc, win32api.RGB(255, 255, 255))
+                    rect = win32gui.GetClientRect(hwnd)
+                    win32gui.DrawText(hdc, BANNER_TEXT, -1, rect,
+                                      win32con.DT_CENTER | win32con.DT_VCENTER
+                                      | win32con.DT_SINGLELINE)
+                    win32gui.SelectObject(hdc, old)
+                    win32gui.DeleteObject(font)
+                finally:
+                    win32gui.EndPaint(hwnd, ps)
+                return 0
+            if msg == win32con.WM_DESTROY:
+                win32gui.PostQuitMessage(0)
+                return 0
+        except Exception:
+            pass
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+
+_BANNER = _UiBanner()
+
+
 class Bridge:
     """20 個通用動作。不含業務邏輯。"""
 
@@ -466,6 +633,7 @@ class Bridge:
         自己開著的 Aspen 視窗。
         """
         pid = self._pid
+        _BANNER.hide()
         self._detach_control_panel()
         if self.app is not None:
             try:
@@ -1712,6 +1880,8 @@ class Bridge:
         if op not in self.OPS:
             return _err("UNKNOWN_OP", op)
         self.op_count += 1
+        if op in _UI_OPS:
+            _BANNER.touch()          # 要動畫面了：提醒學生別碰滑鼠
         try:
             return getattr(self, op)(**(args or {}))
         except TypeError as exc:
