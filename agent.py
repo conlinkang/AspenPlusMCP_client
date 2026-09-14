@@ -36,6 +36,31 @@ MAX_ROUNDS = 500         # 防止雲端邏輯有 bug 時無限迴圈
 RETRY_S = (0.5, 1.0, 2.0, 3.0, 5.0)
 
 
+def _cloud_error(exc: urllib.error.HTTPError) -> RuntimeError:
+    """把雲端的錯誤回應翻成學生看得懂的一句話。
+
+    不處理的話 MCP 只會顯示「HTTP Error 429: Too Many Requests」—— 分不出
+    額度用完還是叫太快，也看不到雲端寫好的重置時間。
+    """
+    try:
+        body = json.loads(exc.read().decode("utf-8") or "{}")
+    except Exception:
+        body = {}
+    said = body.get("error") if isinstance(body, dict) else None
+    if body.get("code") == "quota_exceeded":
+        return RuntimeError(
+            "這個帳號本期的工具呼叫額度已經用完（{}）。重試不會成功，這也不是"
+            "模型或 Aspen 的問題；請等重置時間過後再用，需要更多額度請聯絡課程"
+            "助教。".format(said or "用量已達上限"))
+    if exc.code == 429:
+        return RuntimeError("{}。約一分鐘後再呼叫。".format(
+            said or "呼叫太頻繁，請稍候再試"))
+    if exc.code == 401:
+        return RuntimeError("{}（請確認 ASPEN_TOKEN 沒有打錯）".format(
+            said or "憑證無效或帳號已停權"))
+    return RuntimeError("雲端回應 HTTP {}：{}".format(exc.code, said or exc.reason))
+
+
 def post(path: str, payload: dict, timeout: float = 60.0) -> dict:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -47,6 +72,9 @@ def post(path: str, payload: dict, timeout: float = 60.0) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # 雲端有回應、只是拒絕 —— 重試沒有意義，把它的說明轉出來
+            raise _cloud_error(exc) from None
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", exc)
             refused = (isinstance(reason, ConnectionRefusedError)
