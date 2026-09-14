@@ -269,7 +269,7 @@ BANNER_TEXT = ("Aspen MCP is controlling the screen — "
 BANNER_TITLE = "MCP automation notice"
 BANNER_CLASS = "AspenMcpUiBanner"
 BANNER_IDLE_S = 6.0          # 流程裡常停 3 秒；太短會一閃一閃
-_UI_OPS = ("ui_find", "ui_wait", "ui_act", "ui_tree")
+_UI_OPS = ("ui_find", "ui_wait", "ui_act", "ui_tree", "ui_modal_dialogs")
 
 
 class _UiBanner:
@@ -1681,6 +1681,79 @@ class Bridge:
                               "age_s": round((now_ft - created) / 1e7, 1)})
         return _ok({"processes": out, "sample_s": sample_s})
 
+    # ══ Aspen 的強制回應對話框 ════════════════════════════════════════════
+    # 2026-09-14 找到的真因：評估「沒啟動」時，Aspen 其實跳了一個強制回應
+    # 對話框「Failed getting XML from Economic Evalution program」，主視窗被
+    # 鎖住（停用）。這時所有對主視窗的 UIA 搜尋都卡 65 秒逾時，引擎閒著在等，
+    # 沒人按 OK 就永遠卡著。
+    #
+    # 找對話框用 Win32（卡住時照樣可用），讀內容與按鈕用「只限這個對話框」
+    # 的 UIA（實測 3 秒內回來，不會像整個主視窗那樣卡住）。要不要按、按哪個
+    # 由雲端決定 —— 這裡只回報、並把按鈕快取起來給 ui_act 用。
+    # 只看這個 bridge 自己開的那一份 Aspen。
+    def ui_modal_dialogs(self) -> dict:
+        """列出 Aspen 目前開著的強制回應對話框（標題、文字、按鈕）。"""
+        if not self._pid:
+            return _ok({"dialogs": [], "note": "還沒有連上 Aspen"})
+        ok, why = _interactive_desktop()
+        if not ok:
+            return _err("NO_INTERACTIVE_DESKTOP", why)
+        import win32con
+        import win32gui
+        import win32process
+
+        candidates = []
+
+        def cb(hwnd, _):
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid != self._pid:
+                    return True
+                owner = win32gui.GetWindow(hwnd, win32con.GW_OWNER)
+                # 強制回應：有擁有者，而且擁有者被停用了
+                if owner and not win32gui.IsWindowEnabled(owner):
+                    candidates.append((hwnd, owner))
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(cb, None)
+
+        dialogs = []
+        for hwnd, owner in candidates:
+            entry = {"hwnd": int(hwnd), "owner_hwnd": int(owner),
+                     "title": win32gui.GetWindowText(hwnd),
+                     "texts": [], "buttons": []}
+            try:
+                auto = self._auto()
+                dlg = auto.ControlFromHandle(hwnd)
+                entry["id"] = self._cache(dlg)
+
+                def walk(ctrl, depth):
+                    if depth > 4:
+                        return
+                    for child in ctrl.GetChildren():
+                        kind = child.ControlTypeName
+                        name = (child.Name or "").strip()
+                        if kind == "ButtonControl":
+                            entry["buttons"].append({
+                                "id": self._cache(child), "name": name,
+                                "auto_id": child.AutomationId or ""})
+                            continue          # 按鈕裡的文字（例如 "_OK"）不算訊息
+                        if kind == "TitleBarControl":
+                            continue          # 標題列的「關閉」「系統」不是對話框內容
+                        if kind == "TextControl" and name:
+                            entry["texts"].append(name)
+                        walk(child, depth + 1)
+
+                walk(dlg, 1)
+            except Exception as exc:
+                entry["read_error"] = repr(exc)[:200]
+            dialogs.append(entry)
+        return _ok({"dialogs": dialogs})
+
     def clock(self) -> dict:
         """本機時間。雲端要拿「點下按鈕那一刻」跟檔案時間比，就先問這個。"""
         return _ok({"now": time.time()})
@@ -1872,6 +1945,7 @@ class Bridge:
         "run", "run_status", "reinit", "get_log",
         "ui_tree", "ui_find", "ui_wait", "ui_act", "sleep", "read_table",
         "clock", "fs_wait", "fs_list", "fs_read_text", "proc_status",
+        "ui_modal_dialogs",
     )
 
     def execute(self, op: str, args: dict | None = None) -> dict:
