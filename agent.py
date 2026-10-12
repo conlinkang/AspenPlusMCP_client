@@ -22,7 +22,7 @@ import urllib.request
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bridge import Bridge  # noqa: E402
+from bridge import Bridge, _aspen_pids  # noqa: E402
 
 CLOUD = os.environ.get("ASPEN_CLOUD", "http://127.0.0.1:8787")
 TOKEN = os.environ.get("ASPEN_TOKEN", "demo-token")
@@ -204,13 +204,20 @@ def serve_mcp() -> None:
 
 # ── 不經 MCP 的直接測試 ─────────────────────────────────────────────
 def selftest(bkp: str) -> int:
-    """繞過 MCP，直接驗證「代理 ↔ 雲端 ↔ 橋接 ↔ Aspen」整條迴圈。"""
-    import subprocess
+    """繞過 MCP，直接驗證「代理 ↔ 雲端 ↔ 橋接 ↔ Aspen」整條迴圈。
+
+    只開自己的一份 Aspen，結束時只關自己的那一份（shutdown → Bridge.close
+    會確認那個行程真的結束）。這裡以前開頭和結尾各用映像檔名砍一次
+    AspenPlus.exe —— 機器上每一份都中，包括使用者正開著、還沒存檔的模型。
+    """
     import time
 
-    for image in ("AspenPlus.exe", "AspenProperties.exe"):
-        subprocess.run(["taskkill", "/F", "/IM", image],
-                       capture_output=True, check=False)
+    others = _aspen_pids()
+    if others:
+        print("注意：已經有 {} 份 Aspen 開著（行程 {}）。自我測試會另外開一份，"
+              "結束時只關自己開的那一份，不會動到它們。要測的檔案如果正開在"
+              "其中一份裡，開檔會失敗 —— 那時請先把它關掉再測。".format(
+                  len(others), "、".join(str(p) for p in others)))
 
     agent = Agent()
     try:
@@ -263,9 +270,6 @@ def selftest(bkp: str) -> int:
         return 0
     finally:
         agent.shutdown()
-        for image in ("AspenPlus.exe", "AspenProperties.exe"):
-            subprocess.run(["taskkill", "/F", "/IM", image],
-                           capture_output=True, check=False)
 
 
 if __name__ == "__main__":
