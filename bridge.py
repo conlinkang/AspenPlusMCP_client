@@ -133,6 +133,7 @@ def _interactive_desktop() -> tuple:
 
 # 開檔最多試幾次、每次之間等多久。模組層級的常數，測試可以蓋掉。
 _OPEN_ATTEMPTS = 3
+_OPEN_PROCESSES = 2       # 載入失敗時最多換幾份全新的 Aspen 再試
 _RETRY_SLEEP = 3.0
 
 # 送出停止要求之後，最多等引擎幾秒才承認它沒停下來。
@@ -181,6 +182,13 @@ def _aspen_pids() -> list:
             except ValueError:
                 pass
     return pids
+
+
+def _same_run(a: str, b: str) -> bool:
+    """兩個檔是不是同一組 Aspen 工作檔：同一個資料夾、同一個主檔名。"""
+    def key(p: str) -> str:
+        return os.path.normcase(os.path.splitext(os.path.abspath(p))[0])
+    return key(a) == key(b)
 
 
 def _locked_by(path: str) -> str | None:
@@ -429,6 +437,7 @@ class Bridge:
         self._run_error: str | None = None
         self._path: str | None = None      # 目前開著的檔，用來找 history 檔
         self._pid: int | None = None       # 自己這一份 Aspen 的行程編號
+        self._progid = "Apwn.Document"     # 這一份是用哪個 ProgID 開的，換一份時照用
         self._cp_messages: list = []        # 這一次執行的 Control Panel 原話
         self._cp_handler = None             # WithEvents 的事件物件，跑完就放掉
         self._cp_capture: str = "not_started"
@@ -451,9 +460,12 @@ class Bridge:
                 return _ok({"progid": "reused"})
             except Exception:
                 self.app = None    # 舊的死了，才真的需要開新的
-        progid = "Apwn.Document.{}.0".format(version) if version else "Apwn.Document"
+        # 沒指定版本就沿用這個橋接層上一次用的：換一份 Aspen（開檔、新建時
+        # 都會）不該順便換了版本。
+        progid = "Apwn.Document.{}.0".format(version) if version else self._progid
         try:
             self.app = win32.Dispatch(progid)
+            self._progid = progid
             # 記下行程編號。關檔時要確認這一份真的結束了，開檔失敗時也
             # 要能把「別人留下的」和「自己這一份」分開講。
             try:
@@ -510,6 +522,12 @@ class Bridge:
         兩者不等價：實測 InitFromFile2 開同一個 .bkp 後，部分字串欄位
         （例如物流的 LSSOURCE）讀回 None，而 InitFromArchive 讀回空字串。
         這種差異不會報錯，只會讓資料悄悄變樣，所以必須明確指定。
+
+        這一份 Aspen 已經有文件時不能直接載入（見 _open_replacing）：會在
+        另一份 Aspen 上開，回傳多一個 replaced，講明換掉了哪一個行程、
+        哪一個檔。那時的失敗用兩個專用的錯誤碼分開：
+            OPEN_FAILED_MODEL_KEPT    新檔沒開成，原本的模型還在
+            OPEN_FAILED_MODEL_CLOSED  新檔沒開成，原本的模型也已經關了
         """
         if self.app is None:
             return _err("NOT_CONNECTED", "需先 connect")
@@ -522,25 +540,168 @@ class Bridge:
                     "目錄在，但沒有這個檔名（大小寫與副檔名 .bkp/.apw/.apwz 都要對）")
             return _err("FILE_NOT_FOUND",
                         self._open_failure("找不到檔案：{}（{}）".format(path, hint)))
-        # 開檔會間歇性失敗（「Unable to open file」2041），同一個檔案等幾秒
-        # 再開就成功 —— 實測重試 100% 恢復。這是少數該由橋接層自己處理的
-        # 重試：檔案存在性已經確認過，剩下的是 Aspen 自己還沒準備好。
-        # 回報試了幾次，免得真的壞掉時被這層重試遮住。
+        if self._holds_document(self.app):
+            return self._open_replacing(path, loader)
+        attempts, last = self._load(self.app, loader, path)
+        if last is None:
+            self._path = path
+            data = {"path": path, "loader": loader}
+            if attempts > 1:
+                data["attempts"] = attempts
+            return _ok(data)
+        detail = self._open_failure(repr(last))
+        if not self._holds_document(self.app):
+            # 這一份還是乾淨的（檔案被鎖之類，Aspen 連文件都沒建）：照舊回報。
+            return _err("COM_ERROR", "{}（已重試 {} 次）".format(detail, attempts))
+        # 載入失敗把這一份 Aspen 用掉了：實測一個讀不進去的 .inp 失敗之後，樹
+        # 已經在了（留下讀到一半的文件），同一份 Aspen 接著開好的 .bkp 一樣回
+        # 2041。留著它，後面每一次開檔都會失敗，list_model 還會把那個半成品
+        # 當成模型回報。所以收掉，在新的一份上再試；再不行就留一份乾淨的。
+        self.close()
+        app, pid, again, tried = self._load_on_new_aspen(loader, path)
+        if app is not None:
+            self.app, self._pid, self._path = app, pid, path
+            return _ok({"path": path, "loader": loader, "attempts": attempts + tried})
+        self.connect()
+        return _err("COM_ERROR",
+                    "{}；換成全新的 Aspen 再試 {} 次也一樣：{}。目前沒有載入任何模型"
+                    .format(detail, tried, again))
+
+    @staticmethod
+    def _holds_document(app) -> bool:
+        """這一份 Aspen 是不是已經有文件了（新建、開檔，或載入到一半失敗）。
+
+        實測：剛 Dispatch、還沒載入任何東西時，碰 Tree 會丟 2002；一旦載入過
+        （成功或失敗），樹的 Data 節點就找得到。
+        """
+        if app is None:
+            return False
+        try:
+            return app.Tree.FindNode("\\Data") is not None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _load(app, loader: str, path: str) -> tuple:
+        """把檔案載入一份**還沒有文件**的 Aspen。回 (試了幾次, 最後的例外或 None)。
+
+        開檔會間歇性失敗（「Unable to open file」2041），同一個檔案等幾秒
+        再開就成功。檔案存在性已經確認過，剩下的是 Aspen 自己還沒準備好，
+        所以這一層自己重試，並回報試了幾次，免得真的壞掉時被重試遮住。
+
+        但只有在這一份 Aspen 還乾淨的時候才值得在原地重試。失敗的那一次
+        如果已經留下文件，這個物件就不收第二次載入了（見 _open_replacing），
+        再試只是白等 —— 那種情況由呼叫端換一份 Aspen。
+        """
         last = None
+        attempt = 0
         for attempt in range(1, _OPEN_ATTEMPTS + 1):
             try:
-                getattr(self.app, loader)(path)
-                self._path = path
-                data = {"path": path, "loader": loader}
-                if attempt > 1:
-                    data["attempts"] = attempt
-                return _ok(data)
+                getattr(app, loader)(path)
+                return attempt, None
             except Exception as exc:
                 last = exc
+                if Bridge._holds_document(app):
+                    break
                 if attempt < _OPEN_ATTEMPTS:
                     time.sleep(_RETRY_SLEEP)
-        return _err("COM_ERROR", "{}（已重試 {} 次）".format(
-            self._open_failure(repr(last)), _OPEN_ATTEMPTS))
+        return attempt, last
+
+    def _load_on_new_aspen(self, loader: str, path: str) -> tuple:
+        """在全新的 Aspen 上載入。回 (app, pid, 失敗原因或 None, 用了幾份 Aspen)。
+
+        失敗時 app 是 None，試過的那幾份都已經收掉。重試是換一份新的再試，
+        不是在同一份上再試：實測間歇性的 2041 也會把那一份用掉（同一個
+        剛匯出的 .inp，七次裡一次在第二份 Aspen 上開不起來，換一份就開了）。
+        self.app 不會被動到，由呼叫端決定要不要換手。
+        """
+        why = None
+        for n in range(1, _OPEN_PROCESSES + 1):
+            if n > 1:
+                time.sleep(_RETRY_SLEEP)
+            try:
+                app = win32.Dispatch(self._progid)
+            except Exception as exc:
+                why = "開不了新的一份 Aspen：{}".format(repr(exc))
+                continue
+            try:
+                pid = int(app.ProcessId)
+            except Exception:
+                pid = None
+            _, last = self._load(app, loader, path)
+            if last is None:
+                return app, pid, None, n
+            parts = [repr(last)]
+            for attr in ("FailedToOpenDescription", "FailedToOpenKey"):
+                try:
+                    said = getattr(app, attr)
+                except Exception:
+                    continue
+                if said:
+                    parts.append("Aspen 說：{}".format(said))
+            why = "；".join(parts)
+            try:
+                app.Close()
+            except Exception:
+                pass
+            if pid and _pid_alive(pid):
+                _kill_pid(pid)
+        return None, None, why, _OPEN_PROCESSES
+
+    def _open_replacing(self, path: str, loader: str) -> dict:
+        """這一份 Aspen 已經有文件時的開檔：開在新的一份上，開成了才換手。
+
+        Aspen 的一個文件物件只能載入一次。實測（V14）：已經載入過之後，
+        InitFromArchive／InitFromArchive2／InitFromFile2 一律在 0 秒內回
+        2041「Unable to open file」，FailedToOpenDescription 是空的 ——
+        不論要開的是 .bkp 還是 .inp、原本的模型存過沒有、先 Reinit 過沒有、
+        對話框有沒有關掉，全部一樣。那不是「檔案開不了」，是這個物件不收
+        第二個檔；InitNew2 的 2001 是同一件事（見 create_file）。
+
+        所以要另開一份 Aspen。順序是先開新的、載入成功了才關舊的：要開的
+        檔案本身有問題時（路徑對、內容讀不進去），原本開著的模型原封不動，
+        不會為了一次開不成的檔賠掉使用者手上的模型。兩份 Aspen 只在載入的
+        那幾秒同時存在。
+        """
+        old_pid, old_path = self._pid, self._path
+        if old_path and _same_run(old_path, path):
+            return self._open_after_closing(path, loader, old_pid, old_path)
+        app, pid, why, tried = self._load_on_new_aspen(loader, path)
+        if app is None:
+            return _err("OPEN_FAILED_MODEL_KEPT",
+                        "{}（在 {} 份全新的 Aspen 上各試過）。原本開著的模型沒有動。"
+                        "多半是這個檔本身讀不進去；另一個可能是它和開著的模型共用"
+                        "工作檔，那要先關掉模型才開得了".format(why, tried))
+        closed = self.close()              # 收掉舊的那一份（連同它的事件、控制項快取）
+        self.app, self._pid, self._path = app, pid, path
+        return _ok({"path": path, "loader": loader,
+                    "replaced": {"previous_pid": old_pid, "previous_path": old_path,
+                                 "had_to_force_close":
+                                     (closed.get("data") or {}).get("had_to_force_close")}})
+
+    def _open_after_closing(self, path: str, loader: str, old_pid, old_path) -> dict:
+        """要開的檔和開著的模型是同一組工作檔時：只能先關再開。
+
+        Aspen 的工作檔跟著「資料夾＋主檔名」走。實測：開著 c.bkp 的時候，
+        另一份 Aspen 開同一個資料夾的 c.inp 回 2041 —— 那一組檔被原本的
+        行程佔著；把原本那一份關掉之後同一個檔就開得起來。重開同一個檔
+        （放棄修改）、匯出成同名 .inp 再開回來（重新排版）都是這種情況。
+
+        這條路沒有退路：新檔開不成的話，原本的模型已經關了。回報裡要講。
+        """
+        closed = self.close()
+        app, pid, why, tried = self._load_on_new_aspen(loader, path)
+        if app is None:
+            self.connect()                 # 留一份乾淨的，下一次開檔才接得上
+            return _err("OPEN_FAILED_MODEL_CLOSED",
+                        "{}（在 {} 份全新的 Aspen 上各試過）。原本開著的模型（{}）"
+                        "和要開的檔共用工作檔，為了開它已經先關閉、沒有存檔；"
+                        "目前沒有載入任何模型。".format(why, tried, old_path))
+        self.app, self._pid, self._path = app, pid, path
+        return _ok({"path": path, "loader": loader,
+                    "replaced": {"previous_pid": old_pid, "previous_path": old_path,
+                                 "had_to_force_close":
+                                     (closed.get("data") or {}).get("had_to_force_close")}})
 
     def _open_failure(self, detail: str) -> str:
         """開檔失敗時，把能查到的線索一起帶回去。
