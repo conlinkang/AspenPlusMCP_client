@@ -1108,8 +1108,15 @@ class Bridge:
         return entry
 
     def subtree(self, path: str, max_nodes: int = 20000,
-                detail: str = "value") -> dict:
+                detail: str = "value", max_depth: int | None = None,
+                skip: list | None = None) -> dict:
         """一次取回整個子樹。
+
+        max_depth / skip 只為狀態掃描用：帶狀態的節點最深只到 Data 樹底下第 4 層，
+        而且區塊、物流的 Input／Output 底下一個都沒有（2026-10-16 在 IPA、C10、
+        C12、C13 四個模型上和全掃逐一比對過，節點集合完全相同）。全掃要走一兩萬
+        個資料欄位、10–35 秒；限深度、跳過 Input／Output 只剩幾千個。
+        skip 裡的名字照樣記錄那個節點本身，只是不往下走。
 
         detail="status" 只回傳帶完成度狀態（compstatus）的節點。給「整棵樹
                         哪裡沒設完」這種檢查用：實測 C10 全樹 20,393 個節點，
@@ -1132,11 +1139,12 @@ class Bridge:
             return _err(exc.code, exc.detail)
 
         out: dict = {}
-        stack = [(path, root, None)]
+        stack = [(path, root, None, 0)]
         visited = 0
         collisions = 0
+        skip_names = set(skip or ())
         while stack and visited < max_nodes:
-            cur, node, idx = stack.pop()
+            cur, node, idx, depth = stack.pop()
             visited += 1
             entry = self._record(node, detail)
             if entry is not None:
@@ -1153,9 +1161,13 @@ class Bridge:
                     key = "{}#{}".format(key, idx)
                     collisions += 1
                 out[key] = entry
+            if max_depth is not None and depth >= max_depth:
+                continue
+            if depth and cur.rsplit("\\", 1)[-1] in skip_names:
+                continue
             try:
                 for n, el in enumerate(node.Elements):
-                    stack.append((cur + "\\" + el.Name, el, n))
+                    stack.append((cur + "\\" + el.Name, el, n, depth + 1))
             except Exception:
                 pass
         return _ok({"root": path, "nodes": out, "count": len(out),
@@ -1333,10 +1345,12 @@ class Bridge:
             pythoncom.PumpWaitingMessages()
             if self._run_done.is_set():
                 elapsed = round(time.monotonic() - self._run_started, 1)
-                # 引擎結束後尾端還有幾行在佇列裡，再抽幾次才收得齊。
-                for _ in range(10):
-                    pythoncom.PumpWaitingMessages()
-                    time.sleep(0.02)
+                # 引擎結束後尾端還有幾行在佇列裡，要抽到安靜下來才收得齊。以前固定
+                # 抽 0.2 秒，常常停在 "Convergence iterations:"，收斂表和
+                # "Simulation calculations completed" 都沒收到（C2 兩次實測）。
+                # 現在：看到結尾行、而且 0.4 秒沒有新訊息就停；沒看到結尾行時
+                # 安靜 1 秒也停；最多 3 秒。
+                self._drain_control_panel()
                 self._detach_control_panel()
                 extra = {"control_panel": list(self._cp_messages),
                          "control_panel_capture": self._cp_capture}
@@ -1354,6 +1368,28 @@ class Bridge:
                             "elapsed_s": round(
                                 time.monotonic() - self._run_started, 1)})
             self._run_done.wait(0.25)
+
+    _CP_END_MARKS = ("CALCULATIONS COMPLETED", "NO ERRORS OR WARNINGS",
+                     "ERRORS WERE ISSUED", "WARNINGS WERE ISSUED",
+                     "SIMULATION COMPLETED", "TERMINATED")
+
+    def _drain_control_panel(self, limit_s: float = 3.0) -> None:
+        import pythoncom
+        start = time.monotonic()
+        seen = len(self._cp_messages)
+        quiet_since = start
+        while time.monotonic() - start < limit_s:
+            pythoncom.PumpWaitingMessages()
+            time.sleep(0.05)
+            now = time.monotonic()
+            if len(self._cp_messages) != seen:
+                seen = len(self._cp_messages)
+                quiet_since = now
+                continue
+            tail = " ".join(str(m) for m in list(self._cp_messages)[-6:]).upper()
+            ended = any(mark in tail for mark in self._CP_END_MARKS)
+            if now - quiet_since >= (0.4 if ended else 1.0):
+                break
 
     def _detach_control_panel(self) -> None:
         """放掉事件物件。留著會持有 COM 參考，關檔時可能卡住。"""
