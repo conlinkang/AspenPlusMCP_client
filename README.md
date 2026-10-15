@@ -167,8 +167,12 @@ python setup_student.py --check
 `bridge.py`）。管理者通知有新版時：
 
 1. 重新下載這幾個檔案，蓋掉原來的（或在資料夾裡 `git pull`）。
-2. **完全關閉再重開 Claude Desktop** —— `agent.py` 是 Claude 啟動時載入的，
-   不重開不會換到新版。
+2. **完全關閉再重開 Claude Desktop**（用 Codex 等其他 MCP 用戶端的話，一樣要重開，
+   或在設定裡重新啟動 aspen 這個 MCP）—— `agent.py` 是啟動時載入的，不重開不會換到
+   新版。
+
+雲端那一半由管理者更新，學生不用做任何事。想知道雲端目前是哪一版，在 Claude 裡呼叫
+`my_usage`：回覆的 `server_version` 就是（這個查詢不扣額度）。
 
 工具回覆裡若出現 `control_panel_capture` 不是 `ok`、或 `note` 說「橋接程式
 是舊版」，就是還沒更新到新版。
