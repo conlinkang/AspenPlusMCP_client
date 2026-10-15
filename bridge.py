@@ -92,8 +92,9 @@ def _written(before: dict, after: dict) -> list:
 # 是呼叫端收到「NOT_CONNECTED: 」—— 一個冒號後面什麼都沒有，看不出要做
 # 什麼。這裡給預設值，呼叫點自己有話講時不會被蓋掉。
 _DEFAULT_DETAIL = {
-    "NOT_CONNECTED": "目前沒有連著的 Aspen。先用 open_project 開檔，"
-                     "或用 new_project 建一個空白專案。",
+    "NOT_CONNECTED": "No Aspen instance is connected. Open a file with "
+                     "open_project first, or create a blank project with "
+                     "new_project.",
 }
 
 
@@ -122,13 +123,15 @@ def _interactive_desktop() -> tuple:
             user32.CloseDesktop(handle)
             return True, "ok"
         remote = bool(user32.GetSystemMetrics(0x1000))      # SM_REMOTESESSION
-        return False, ("沒有可以操作的桌面：目前這個工作階段沒有在接收輸入"
-                       "（遠端連線已中斷、或畫面鎖住了）。"
-                       "UI 自動化在這種狀態下一定失敗。"
-                       "請把遠端桌面接回來、或在本機解鎖畫面後重試。"
-                       + ("（偵測到這是遠端連線工作階段）" if remote else ""))
+        return False, ("There is no usable desktop: this session is not "
+                       "receiving input (the remote connection was "
+                       "disconnected, or the screen is locked). UI "
+                       "automation always fails in this state. Reconnect "
+                       "the remote desktop, or unlock the screen "
+                       "locally, then try again."
+                       + (" (this was detected as a remote connection session)" if remote else ""))
     except Exception:
-        return True, "檢查不出來，當作可以用"
+        return True, "could not be checked; assuming it is usable"
 
 
 # 開檔最多試幾次、每次之間等多久。模組層級的常數，測試可以蓋掉。
@@ -204,10 +207,10 @@ def _locked_by(path: str) -> str | None:
             return None
     except PermissionError:
         others = _aspen_pids()
-        tail = (" 目前還有 {} 個 AspenPlus.exe 在跑（PID {}），很可能就是它們。"
-                .format(len(others), "、".join(str(p) for p in others))
+        tail = (" There are still {} AspenPlus.exe processes running (PID {}); they are most likely the cause."
+                .format(len(others), ", ".join(str(p) for p in others))
                 if others else "")
-        return "檔案被別的程式開著，無法寫入：{}。{}".format(path, tail)
+        return "The file is open in another program and cannot be written: {}.{}".format(path, tail)
     except OSError:
         return None
 
@@ -502,12 +505,12 @@ class Bridge:
             reconnected = self.connect()
             if not reconnected.get("ok"):
                 return _err("COM_ERROR",
-                            "InitNew2 失敗（{}），重開 Aspen 也失敗：{}".format(
+                            "InitNew2 failed ({}), and restarting Aspen also failed: {}".format(
                                 repr(first), reconnected.get("error")))
             try:
                 self.app.InitNew2()
             except Exception as second:
-                return _err("COM_ERROR", "重開一份 Aspen 之後 InitNew2 仍失敗：{}".format(repr(second)))
+                return _err("COM_ERROR", "InitNew2 still failed after starting a new Aspen instance: {}".format(repr(second)))
             self._path = None
             return _ok({"recycled": True, "pid": self._pid, "previous_pid": old_pid,
                         "previous_path": previous_path,
@@ -530,16 +533,16 @@ class Bridge:
             OPEN_FAILED_MODEL_CLOSED  新檔沒開成，原本的模型也已經關了
         """
         if self.app is None:
-            return _err("NOT_CONNECTED", "需先 connect")
+            return _err("NOT_CONNECTED", "connect first")
         loader = {"archive": "InitFromArchive", "file": "InitFromFile2"}.get(mode)
         if loader is None:
-            return _err("BAD_ARG", "mode 只能是 archive 或 file")
+            return _err("BAD_ARG", "mode must be archive or file")
         if not os.path.isfile(path):
             folder = os.path.dirname(os.path.abspath(path))
-            hint = ("目錄也不存在" if not os.path.isdir(folder) else
-                    "目錄在，但沒有這個檔名（大小寫與副檔名 .bkp/.apw/.apwz 都要對）")
+            hint = ("the folder does not exist either" if not os.path.isdir(folder) else
+                    "the folder exists, but there is no file with this name (case and the .bkp/.apw/.apwz extension must match)")
             return _err("FILE_NOT_FOUND",
-                        self._open_failure("找不到檔案：{}（{}）".format(path, hint)))
+                        self._open_failure("File not found: {} ({})".format(path, hint)))
         if self._holds_document(self.app):
             return self._open_replacing(path, loader)
         attempts, last = self._load(self.app, loader, path)
@@ -552,7 +555,7 @@ class Bridge:
         detail = self._open_failure(repr(last))
         if not self._holds_document(self.app):
             # 這一份還是乾淨的（檔案被鎖之類，Aspen 連文件都沒建）：照舊回報。
-            return _err("COM_ERROR", "{}（已重試 {} 次）".format(detail, attempts))
+            return _err("COM_ERROR", "{} (retried {} times)".format(detail, attempts))
         # 載入失敗把這一份 Aspen 用掉了：實測一個讀不進去的 .inp 失敗之後，樹
         # 已經在了（留下讀到一半的文件），同一份 Aspen 接著開好的 .bkp 一樣回
         # 2041。留著它，後面每一次開檔都會失敗，list_model 還會把那個半成品
@@ -564,7 +567,7 @@ class Bridge:
             return _ok({"path": path, "loader": loader, "attempts": attempts + tried})
         self.connect()
         return _err("COM_ERROR",
-                    "{}；換成全新的 Aspen 再試 {} 次也一樣：{}。目前沒有載入任何模型"
+                    "{}; trying {} more times in a fresh Aspen instance gave the same result: {}. No model is loaded now"
                     .format(detail, tried, again))
 
     @staticmethod
@@ -622,7 +625,7 @@ class Bridge:
             try:
                 app = win32.Dispatch(self._progid)
             except Exception as exc:
-                why = "開不了新的一份 Aspen：{}".format(repr(exc))
+                why = "Could not start a new Aspen instance: {}".format(repr(exc))
                 continue
             try:
                 pid = int(app.ProcessId)
@@ -638,8 +641,8 @@ class Bridge:
                 except Exception:
                     continue
                 if said:
-                    parts.append("Aspen 說：{}".format(said))
-            why = "；".join(parts)
+                    parts.append("Aspen said: {}".format(said))
+            why = "; ".join(parts)
             try:
                 app.Close()
             except Exception:
@@ -669,9 +672,12 @@ class Bridge:
         app, pid, why, tried = self._load_on_new_aspen(loader, path)
         if app is None:
             return _err("OPEN_FAILED_MODEL_KEPT",
-                        "{}（在 {} 份全新的 Aspen 上各試過）。原本開著的模型沒有動。"
-                        "多半是這個檔本身讀不進去；另一個可能是它和開著的模型共用"
-                        "工作檔，那要先關掉模型才開得了".format(why, tried))
+                        "{} (tried in {} fresh Aspen instances). The "
+                        "model that was open was not touched. Most "
+                        "likely the file itself cannot be read; another "
+                        "possibility is that it shares working files "
+                        "with the open model, in which case the model "
+                        "must be closed before it can be opened".format(why, tried))
         closed = self.close()              # 收掉舊的那一份（連同它的事件、控制項快取）
         self.app, self._pid, self._path = app, pid, path
         return _ok({"path": path, "loader": loader,
@@ -694,9 +700,10 @@ class Bridge:
         if app is None:
             self.connect()                 # 留一份乾淨的，下一次開檔才接得上
             return _err("OPEN_FAILED_MODEL_CLOSED",
-                        "{}（在 {} 份全新的 Aspen 上各試過）。原本開著的模型（{}）"
-                        "和要開的檔共用工作檔，為了開它已經先關閉、沒有存檔；"
-                        "目前沒有載入任何模型。".format(why, tried, old_path))
+                        "{} (tried in {} fresh Aspen instances). The "
+                        "model that was open ({}) shares working files "
+                        "with the file being opened, so it was closed "
+                        "first without saving; no model is loaded now.".format(why, tried, old_path))
         self.app, self._pid, self._path = app, pid, path
         return _ok({"path": path, "loader": loader,
                     "replaced": {"previous_pid": old_pid, "previous_path": old_path,
@@ -717,17 +724,19 @@ class Bridge:
             except Exception:
                 continue
             if said:
-                parts.append("Aspen 說：{}".format(said))
+                parts.append("Aspen said: {}".format(said))
         others = [p for p in _aspen_pids() if p != self._pid]
         if others:
             parts.append(
-                "另外有 {} 個 AspenPlus.exe 還在跑（PID {}）。這類殘留會鎖住 "
-                ".bkp，是開檔失敗最常見的原因。確認畫面上沒有你自己開著、"
-                "還沒存檔的 Aspen 之後，可以用 "
-                "Stop-Process -Id {} -Force 清掉再重試。".format(
-                    len(others), "、".join(str(p) for p in others),
+                "There are also {} AspenPlus.exe processes still running "
+                "(PID {}). Leftovers like these lock .bkp files and are "
+                "the most common reason opening fails. After making sure "
+                "none of them is an Aspen window of your own with "
+                "unsaved work, you can clear them with Stop-Process -Id "
+                "{} -Force and try again.".format(
+                    len(others), ", ".join(str(p) for p in others),
                     ",".join(str(p) for p in others)))
-        return "；".join(parts)
+        return "; ".join(parts)
 
     def save(self, path: str | None = None, overwrite: bool | None = None,
              export_type: int | None = None) -> dict:
@@ -751,17 +760,17 @@ class Bridge:
             folder = os.path.dirname(os.path.abspath(path))
             if not os.path.isdir(folder):
                 return _err("DIR_NOT_FOUND",
-                            "目錄不存在：{}。先建立目錄，或改存到既有的資料夾。"
+                            "Folder does not exist: {}. Create the folder first, or save to an existing folder."
                             .format(folder))
             if os.path.exists(path) and not os.access(path, os.W_OK):
-                return _err("FILE_READONLY", "檔案是唯讀的：{}".format(path))
+                return _err("FILE_READONLY", "The file is read-only: {}".format(path))
             locked = _locked_by(path)
             if locked:
                 return _err("FILE_LOCKED", locked)
         try:
             if export_type is not None:
                 if not path:
-                    return _err("BAD_ARG", "匯出必須指定 path")
+                    return _err("BAD_ARG", "path is required for export")
                 before = _stamps(path)
                 self.app.Export(int(export_type), path)
                 # 匯出成功與否要看檔案在不在，不能只看有沒有丟例外。
@@ -818,7 +827,7 @@ class Bridge:
         if self.app is None:
             return _err("NOT_CONNECTED")
         if name not in self._APP_PROPS:
-            return _err("BAD_ARG", "只允許 {}".format(", ".join(self._APP_PROPS)))
+            return _err("BAD_ARG", "only allowed: {}".format(", ".join(self._APP_PROPS)))
         try:
             if value is None:
                 return _ok({"name": name, "value": getattr(self.app, name)})
@@ -841,7 +850,7 @@ class Bridge:
         原因就在這裡。
         """
         if self.app is None:
-            raise BridgeError("NOT_CONNECTED", "需先 connect")
+            raise BridgeError("NOT_CONNECTED", "connect first")
         node = self.app.Tree.FindNode(path)
         if node is None:
             raise BridgeError("PATH_NOT_FOUND", path)
@@ -861,7 +870,7 @@ class Bridge:
                     return element
         except Exception:
             pass
-        raise BridgeError("PATH_NOT_FOUND", "{} 底下沒有 {!r}".format(
+        raise BridgeError("PATH_NOT_FOUND", "{} has no {!r}".format(
             path, child))
 
     def get(self, path: str, child: str | None = None) -> dict:
@@ -945,7 +954,7 @@ class Bridge:
             pass
         if dim not in (None, 0) and unit is None and not allow_default_unit:
             return _err("UNIT_REQUIRED",
-                        "{} 有單位維度 {}，必須指定 unit".format(path, dim))
+                        "{} has unit dimension {}, so unit is required".format(path, dim))
 
         try:
             if basis is not None:
@@ -991,9 +1000,9 @@ class Bridge:
         """
         if action not in ("insert", "remove", "label", "labels"):
             return _err("BAD_ARG",
-                        "action 只能是 insert、remove、label 或 labels")
+                        "action must be insert, remove, label or labels")
         if action == "label" and label is None:
-            return _err("BAD_ARG", "label 動作必須給 label")
+            return _err("BAD_ARG", "the label action needs label")
         try:
             elements = self._node(path).Elements
             if action == "labels":
@@ -1116,7 +1125,7 @@ class Bridge:
         批次不是最佳化，是可行性前提。
         """
         if detail not in ("status", "value", "full"):
-            return _err("BAD_ARG", "detail 只能是 status、value 或 full")
+            return _err("BAD_ARG", "detail must be status, value or full")
         try:
             root = self._node(path)
         except BridgeError as exc:
@@ -1217,22 +1226,26 @@ class Bridge:
                             "stopped": stopped,
                             "waited_s": 0 if stopped else STOP_WAIT_S,
                             "detail": None if stopped else
-                            "已經送出停止要求，但引擎在 {:.0f} 秒內沒有停下來。"
-                            "這一份 Aspen 不能再啟動新的執行了 —— 先用 "
-                            "close_project 關掉再重開，或直接換一份。"
+                            "A stop request was sent, but the engine did "
+                            "not stop within {:.0f} seconds. This Aspen "
+                            "instance cannot start a new run: close it "
+                            "with close_project and reopen, or switch to "
+                            "another instance."
                             .format(STOP_WAIT_S)})
             if action != "start":
-                return _err("BAD_ARG", "action 只能是 start 或 stop")
+                return _err("BAD_ARG", "action must be start or stop")
             if self._run_done is not None and not self._run_done.is_set():
                 running_for = (time.monotonic() - (self._run_started or 0)
                                if self._run_started else None)
                 return _err("ALREADY_RUNNING",
-                            "這一份 Aspen 還有一次執行沒有結束{}。"
-                            "同時跑兩次會讓兩邊都拿不到正確結果。"
-                            "先用 run(action='stop') 停掉；若停不下來，"
-                            "那次執行已經卡死在引擎裡，close_project 再重開"
-                            "是唯一的出路。".format(
-                                "（已經跑了 {:.0f} 秒）".format(running_for)
+                            "This Aspen instance still has a run that "
+                            "has not finished{}. Running twice at once "
+                            "gives wrong results for both. Stop it first "
+                            "with run(action='stop'); if it cannot be "
+                            "stopped, that run is stuck in the engine "
+                            "and close_project followed by reopening is "
+                            "the only way out.".format(
+                                " (running for {:.0f} seconds)".format(running_for)
                                 if running_for else ""))
 
             stream = pythoncom.CoMarshalInterThreadInterfaceInStream(
@@ -1268,13 +1281,14 @@ class Bridge:
                     self._cp_capture = "ok"
                 except Exception as again:
                     self._cp_handler = None
-                    self._cp_capture = ("unavailable: 型別庫(makepy)已重建，"
-                                        "但監聽仍掛不上：" + repr(again)[:160])
+                    self._cp_capture = ("unavailable: the type library (makepy) "
+                                        "was rebuilt, but the listener still "
+                                        "cannot attach: " + repr(again)[:160])
             else:
                 # 這一步失敗不該拖垮執行本身 —— 引擎照跑，只是拿不到
                 # Control Panel 原話，要把「拿不到」講出來，不能默默
                 # 當成沒有訊息。
-                self._cp_capture = ("unavailable: 型別庫(makepy)建不起來："
+                self._cp_capture = ("unavailable: the type library (makepy) could not be built: "
                                     + build_err)
 
         def _worker():
@@ -1633,7 +1647,7 @@ class Bridge:
             if action == "parent":
                 parent = ctrl.GetParentControl()
                 if parent is None:
-                    return _err("UI_NOT_FOUND", "沒有父控制項")
+                    return _err("UI_NOT_FOUND", "no parent control")
                 return _ok(self._describe(parent))
             if action == "invoke":
                 ctrl.GetInvokePattern().Invoke()
@@ -1663,13 +1677,13 @@ class Bridge:
                 import win32gui
                 handle = ctrl.NativeWindowHandle
                 if not handle:
-                    return _err("UI_ERROR", "這個控制項沒有視窗代號")
+                    return _err("UI_ERROR", "this control has no window handle")
                 win32gui.PostMessage(handle, 0x00F5, 0, 0)   # BM_CLICK
             elif action == "foreground":
                 import win32gui
                 handle = ctrl.NativeWindowHandle
                 if not handle:
-                    return _err("UI_ERROR", "這個控制項沒有視窗代號")
+                    return _err("UI_ERROR", "this control has no window handle")
                 win32gui.SetForegroundWindow(handle)
             elif action == "close_window":
                 # 送 WM_CLOSE 給視窗本身，不找按鈕。用在「這個視窗有沒有
@@ -1680,7 +1694,7 @@ class Bridge:
                 import win32gui
                 handle = ctrl.NativeWindowHandle
                 if not handle:
-                    return _err("UI_ERROR", "這個控制項沒有視窗代號")
+                    return _err("UI_ERROR", "this control has no window handle")
                 win32gui.PostMessage(handle, win32con.WM_CLOSE, 0, 0)
             elif action == "settext":
                 ctrl.GetValuePattern().SetValue(text or "")
@@ -1855,7 +1869,7 @@ class Bridge:
     def ui_modal_dialogs(self) -> dict:
         """列出 Aspen 目前開著的強制回應對話框（標題、文字、按鈕）。"""
         if not self._pid:
-            return _ok({"dialogs": [], "note": "還沒有連上 Aspen"})
+            return _ok({"dialogs": [], "note": "not connected to Aspen yet"})
         ok, why = _interactive_desktop()
         if not ok:
             return _err("NO_INTERACTIVE_DESKTOP", why)
@@ -1929,10 +1943,10 @@ class Bridge:
         """
         roots = self._fs_roots()
         if not roots:
-            return _err("FS_UNAVAILABLE", "找不到 LOCALAPPDATA")
+            return _err("FS_UNAVAILABLE", "LOCALAPPDATA not found")
         expanded = os.path.expandvars(pattern)
         if not self._fs_allowed(os.path.dirname(expanded.split("*")[0]) or expanded):
-            return _err("FS_FORBIDDEN", "只允許 %LOCALAPPDATA%\\AspenTech 底下的路徑")
+            return _err("FS_FORBIDDEN", "only paths under %LOCALAPPDATA%\\AspenTech are allowed")
         start = time.monotonic()
         timeout_s = max(0.0, min(float(timeout_s), 50.0))
         newer_than = float(newer_than)
@@ -1975,7 +1989,7 @@ class Bridge:
         """列出符合 pattern 的檔案，新的在前（限 AspenTech 工作區）。"""
         expanded = os.path.expandvars(pattern)
         if not self._fs_allowed(os.path.dirname(expanded.split("*")[0]) or expanded):
-            return _err("FS_FORBIDDEN", "只允許 %LOCALAPPDATA%\\AspenTech 底下的路徑")
+            return _err("FS_FORBIDDEN", "only paths under %LOCALAPPDATA%\\AspenTech are allowed")
         files = []
         for path in glob.glob(expanded):
             if not self._fs_allowed(path) or not os.path.isfile(path):
@@ -1994,7 +2008,7 @@ class Bridge:
         """讀一個文字檔（限 AspenTech 工作區）。APEA 的報表是 cp1252。"""
         expanded = os.path.expandvars(path)
         if not self._fs_allowed(expanded):
-            return _err("FS_FORBIDDEN", "只允許 %LOCALAPPDATA%\\AspenTech 底下的路徑")
+            return _err("FS_FORBIDDEN", "only paths under %LOCALAPPDATA%\\AspenTech are allowed")
         if not os.path.isfile(expanded):
             return _err("FILE_NOT_FOUND", expanded)
         size = os.path.getsize(expanded)
@@ -2051,7 +2065,7 @@ class Bridge:
             worker.join(open_timeout_s)
             if worker.is_alive():
                 last_err = TimeoutError(
-                    "開啟超過 {:.0f} 秒沒回應".format(open_timeout_s))
+                    "no response for more than {:.0f} seconds while opening".format(open_timeout_s))
             elif "error" in slot:
                 last_err = slot["error"]
             else:
@@ -2062,7 +2076,7 @@ class Bridge:
         if book is None:
             return _err("READ_ERROR" if not isinstance(last_err, TimeoutError)
                         else "READ_TIMEOUT",
-                        "{}（檔案可能還沒真的寫完或被鎖住，稍等幾秒再試一次：{!r}）"
+                        "{} (the file may not be completely written yet, or it is locked; wait a few seconds and try again: {!r})"
                         .format(repr(last_err), path))
         try:
             names = list(book.sheetnames)
@@ -2143,7 +2157,7 @@ class Bridge:
         if mode is None:
             mode = "stop_on_error" if stop_on_error else "all"
         if mode not in ("all", "stop_on_error", "first_success"):
-            return _err("BAD_ARG", "mode 只能是 all、stop_on_error 或 first_success")
+            return _err("BAD_ARG", "mode must be all, stop_on_error or first_success")
 
         results = []
         for item in ops:

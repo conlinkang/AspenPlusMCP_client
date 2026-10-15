@@ -66,7 +66,7 @@ def _fmt(value, limit: int = 300) -> str:
     if TOKEN and TOKEN in text:
         text = text.replace(TOKEN, "<token>")
     if len(text) > limit:
-        text = text[:limit] + "…(共 {} 字)".format(len(text))
+        text = text[:limit] + "...({} characters in total)".format(len(text))
     # 有空白的字串加引號，一行裡的 key=value 才分得開
     return json.dumps(text, ensure_ascii=False) if plain and (" " in text or not text) else text
 
@@ -131,7 +131,7 @@ def _summary(result) -> dict:
 def _op_brief(op: str, args) -> str:
     args = args or {}
     if op == "batch":
-        return "{} 個動作".format(len(args.get("ops") or []))
+        return "{} operations".format(len(args.get("ops") or []))
     return str(args.get("path") or args.get("action") or "")[:160]
 
 
@@ -148,16 +148,18 @@ def _cloud_error(exc: urllib.error.HTTPError) -> RuntimeError:
     said = body.get("error") if isinstance(body, dict) else None
     if body.get("code") == "quota_exceeded":
         return RuntimeError(
-            "這個帳號本期的工具呼叫額度已經用完（{}）。重試不會成功，這也不是"
-            "模型或 Aspen 的問題；請等重置時間過後再用，需要更多額度請聯絡課程"
-            "助教。".format(said or "用量已達上限"))
+            "This account's tool call quota for this period is used up "
+            "({}). Retrying will not succeed, and this is not a problem "
+            "with the model or Aspen; wait until the reset time, and "
+            "contact the course teaching assistant if more quota is "
+            "needed.".format(said or "usage limit reached"))
     if exc.code == 429:
-        return RuntimeError("{}。約一分鐘後再呼叫。".format(
-            said or "呼叫太頻繁，請稍候再試"))
+        return RuntimeError("{}. Call again in about a minute.".format(
+            said or "too many calls; wait a moment and try again"))
     if exc.code == 401:
-        return RuntimeError("{}（請確認 ASPEN_TOKEN 沒有打錯）".format(
-            said or "憑證無效或帳號已停權"))
-    return RuntimeError("雲端回應 HTTP {}：{}".format(exc.code, said or exc.reason))
+        return RuntimeError("{} (check that ASPEN_TOKEN is typed correctly)".format(
+            said or "invalid credentials or the account is suspended"))
+    return RuntimeError("The cloud server responded HTTP {}: {}".format(exc.code, said or exc.reason))
 
 
 def post(path: str, payload: dict, timeout: float = 60.0) -> dict:
@@ -191,9 +193,12 @@ def post(path: str, payload: dict, timeout: float = 60.0) -> dict:
                     reason=str(reason), s=time.monotonic() - t0)
                 if refused:
                     raise ConnectionError(
-                        "連不上雲端 {}：連線被拒絕，已重試 {} 秒。伺服器可能"
-                        "沒在跑或正在重啟；請稍後再試，或請管理者確認 8787 "
-                        "有在監聽。".format(CLOUD, int(sum(RETRY_S)))) from exc
+                        "Cannot reach the cloud server {}: the "
+                        "connection was refused, retried for {} seconds. "
+                        "The server may not be running or may be "
+                        "restarting; try again later, or ask the "
+                        "administrator to check that port 8787 is "
+                        "listening.".format(CLOUD, int(sum(RETRY_S)))) from exc
                 raise
             log("cloud_refused_retry", path=path, wait_s=wait)
             last = exc
@@ -235,7 +240,7 @@ class Agent:
                 if self.rounds > MAX_ROUNDS:
                     log("call_end", tool=tool, s=time.monotonic() - t0,
                         rounds=self.rounds, ops=n_ops, error="too_many_rounds")
-                    return {"error": "超過 {} 回合，雲端可能有迴圈".format(MAX_ROUNDS)}
+                    return {"error": "More than {} rounds; the cloud server may be looping".format(MAX_ROUNDS)}
                 results, names, t_round = [], [], time.monotonic()
                 for item in reply["ops"]:
                     self.ops_sent += 1
@@ -337,19 +342,26 @@ class CallGate:
         log("gate_still_running", tool=rec["tool"], elapsed_s=took)
         return {
             "still_running": True, "tool": rec["tool"], "elapsed_s": took,
-            "note": ("{0} 還在 Aspen 裡進行（已 {1} 秒），沒有中斷。為了不讓用戶端判逾時，"
-                     "每次呼叫最多等 {2:.0f} 秒就先回話。用**一模一樣的參數**再呼叫一次 "
-                     "{0}，就會接著等、完成後拿到結果。不要重開或關閉專案 —— 那不會讓它"
-                     "比較快，只會排在它後面。".format(rec["tool"], took, self.budget))}
+            "note": ("{0} is still running in Aspen ({1} s so far) and "
+                     "has not been interrupted. So that the client does "
+                     "not time out, each call waits at most {2:.0f} "
+                     "seconds before replying. Call {0} again with "
+                     "**exactly the same arguments** to keep waiting and "
+                     "get the result when it finishes. Do not reopen or "
+                     "close the project: that does not make it faster, "
+                     "it only queues behind it.".format(rec["tool"], took, self.budget))}
 
     def _busy(self, rec: dict, tool: str) -> dict:
         took = int(time.monotonic() - rec["t0"])
         log("gate_busy", refused=tool, running=rec["tool"], elapsed_s=took)
         return {
             "busy": True, "running": rec["tool"], "elapsed_s": took,
-            "error": ("上一個呼叫 {0} 還在 Aspen 裡進行（已 {1} 秒）。Aspen 一次只能做一件"
-                      "事，這次的 {2} **沒有執行**。先用原本的參數再呼叫一次 {0} 拿到它的"
-                      "結果，再做 {2}；不要重開專案。".format(rec["tool"], took, tool))}
+            "error": ("The previous call {0} is still running in Aspen "
+                      "({1} s so far). Aspen can do only one thing at a "
+                      "time, so this {2} **was not executed**. First "
+                      "call {0} again with its original arguments to get "
+                      "its result, then do {2}; do not reopen the "
+                      "project.".format(rec["tool"], took, tool))}
 
     async def call(self, tool: str, args: dict):
         key = _call_key(tool, args)
@@ -383,7 +395,7 @@ class CallGate:
             log("gate_attached_earlier", tool=tool, earlier=earlier["tool"])
             result["earlier_call"] = {
                 "tool": earlier["tool"],
-                "note": "先前沒等到結果的那次 {} 已經完成，這是它的回覆".format(earlier["tool"]),
+                "note": "The earlier call to {} whose result was not awaited has finished; this is its reply".format(earlier["tool"]),
                 "result": said}
         return result
 
@@ -495,7 +507,7 @@ def selftest(bkp: str) -> int:
         print("注意：已經有 {} 份 Aspen 開著（行程 {}）。自我測試會另外開一份，"
               "結束時只關自己開的那一份，不會動到它們。要測的檔案如果正開在"
               "其中一份裡，開檔會失敗 —— 那時請先把它關掉再測。".format(
-                  len(others), "、".join(str(p) for p in others)))
+                  len(others), ", ".join(str(p) for p in others)))
 
     agent = Agent()
     try:
@@ -512,18 +524,18 @@ def selftest(bkp: str) -> int:
             return r
 
         r = step(2, "open_project", {"path": bkp},
-                 lambda r: "opened={} 單位表 {} 筆".format(
+                 lambda r: "opened={}, unit table {} entries".format(
                      r.get("opened"), r.get("units_loaded")))
         if not r.get("opened"):
             print("    ", r.get("error"))
             return 1
 
         step(3, "list_model", {},
-             lambda r: "區塊 {} 物流 {}".format(r.get("blocks"), r.get("streams")))
+             lambda r: "blocks {}, streams {}".format(r.get("blocks"), r.get("streams")))
 
         r = step(4, "get_specs",
                  {"target": "block", "name": "COL1", "only_set": True},
-                 lambda r: "{} 個已設定的欄位".format(r.get("count")))
+                 lambda r: "{} fields set".format(r.get("count")))
         for k in ("NSTAGE", "BASIS_RR", "PRES1", "BASIS_D"):
             if k in (r.get("specs") or {}):
                 v = r["specs"][k]
@@ -533,12 +545,12 @@ def selftest(bkp: str) -> int:
         step(5, "set_specs",
              {"target": "block", "name": "COL1",
               "specs": {"NSTAGE": 25, "PRES1": {"value": 1.5, "unit": "bar"}}},
-             lambda r: "寫入 {} 個，退回 {} 個 {}".format(
+             lambda r: "{} written, {} rejected {}".format(
                  r.get("n_applied"), r.get("n_rejected"), r.get("rejected") or ""))
 
         step(6, "set_specs",
              {"target": "stream", "name": "FEED", "specs": {"TEMP": 60}},
-             lambda r: "退回 {} 個：{}".format(
+             lambda r: "{} rejected: {}".format(
                  r.get("n_rejected"),
                  [v.get("detail") for v in (r.get("rejected") or {}).values()]))
 
