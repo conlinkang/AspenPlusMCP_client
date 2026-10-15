@@ -35,6 +35,10 @@ MAX_ROUNDS = 500         # 防止雲端邏輯有 bug 時無限迴圈
 # 為此整場崩掉。這裡短暫重試，仍然連不上再清楚地講出來。
 RETRY_S = (0.5, 1.0, 2.0, 3.0, 5.0)
 
+# 一次 MCP 工具呼叫最多讓用戶端等幾秒（見 CallGate）。Codex 預設 60 秒就判
+# 逾時，Claude Desktop 也有自己的上限；留一點餘裕。0 表示不限制。
+CALL_BUDGET_S = float(os.environ.get("ASPEN_CALL_BUDGET_S") or 45)
+
 
 def _cloud_error(exc: urllib.error.HTTPError) -> RuntimeError:
     """把雲端的錯誤回應翻成學生看得懂的一句話。
@@ -137,6 +141,114 @@ class Agent:
             pass
 
 
+def _call_key(tool: str, args: dict) -> str:
+    return tool + " " + json.dumps(args or {}, ensure_ascii=False, sort_keys=True,
+                                   default=str)
+
+
+class CallGate:
+    """每次 MCP 呼叫在 budget 秒內一定回話；Aspen 一次只做一件事。
+
+    2026-10-15 上線測試：「逾時，然後模型一直重新開 Aspen 檔案」。一次
+    run_simulation 可以跑上幾分鐘（上限 timeout_s=1800），open_project、讀大
+    模型的結果也常超過一分鐘；用戶端（Codex 預設 60 秒）先判逾時，模型以為
+    壞了，就重開專案。可是舊的呼叫還在唯一的 Aspen 執行緒上跑，新的呼叫排在
+    它後面 —— 又逾時、又重開，越排越長，每一個排到的 open_project 都把 Aspen
+    關掉重開一次。
+
+    這裡的做法：
+      - 呼叫超過 budget 秒還沒完：先回 still_running，工作本身不中斷。
+      - 之後用一模一樣的參數再呼叫一次：接著等，完成就交出那一次的結果。
+      - 還沒完就呼叫別的工具：等到 budget 秒仍沒空，回 busy，**不執行、不排隊**。
+      - 沒人來領的結果，附在下一次呼叫的回覆裡（earlier_call），不會不見。
+    """
+
+    def __init__(self, submit, budget: float = CALL_BUDGET_S) -> None:
+        self.submit = submit          # (tool, args) -> asyncio.Future
+        self.budget = budget
+        self.inflight = None          # 正在跑的那一次
+        self.unclaimed = None         # 跑完了、還沒交給任何人的那一次
+
+    def _finished(self, rec: dict, fut) -> None:
+        rec["done_at"] = time.monotonic()
+        if self.inflight is rec:
+            self.inflight = None
+        if not rec.get("claimed"):
+            self.unclaimed = rec
+
+    async def _wait(self, fut, deadline):
+        """等到 fut 完成回 True；過了 deadline 回 False（fut 照樣繼續跑）。"""
+        import asyncio
+        if self.budget <= 0:
+            await asyncio.shield(fut)
+            return True
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), max(0.0, deadline - time.monotonic()))
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    @staticmethod
+    def _outcome(rec: dict):
+        """跑完的那一次 → 它的結果；那一次丟了例外就照樣丟出去。"""
+        rec["claimed"] = True
+        exc = rec["fut"].exception()
+        if exc is not None:
+            raise exc
+        return rec["fut"].result()
+
+    def _still_running(self, rec: dict) -> dict:
+        took = int(time.monotonic() - rec["t0"])
+        return {
+            "still_running": True, "tool": rec["tool"], "elapsed_s": took,
+            "note": ("{0} 還在 Aspen 裡進行（已 {1} 秒），沒有中斷。為了不讓用戶端判逾時，"
+                     "每次呼叫最多等 {2:.0f} 秒就先回話。用**一模一樣的參數**再呼叫一次 "
+                     "{0}，就會接著等、完成後拿到結果。不要重開或關閉專案 —— 那不會讓它"
+                     "比較快，只會排在它後面。".format(rec["tool"], took, self.budget))}
+
+    def _busy(self, rec: dict, tool: str) -> dict:
+        took = int(time.monotonic() - rec["t0"])
+        return {
+            "busy": True, "running": rec["tool"], "elapsed_s": took,
+            "error": ("上一個呼叫 {0} 還在 Aspen 裡進行（已 {1} 秒）。Aspen 一次只能做一件"
+                      "事，這次的 {2} **沒有執行**。先用原本的參數再呼叫一次 {0} 拿到它的"
+                      "結果，再做 {2}；不要重開專案。".format(rec["tool"], took, tool))}
+
+    async def call(self, tool: str, args: dict):
+        key = _call_key(tool, args)
+        deadline = time.monotonic() + self.budget
+        rec = self.inflight
+        if rec is not None:
+            if not await self._wait(rec["fut"], deadline):
+                return self._still_running(rec) if rec["key"] == key else self._busy(rec, tool)
+        earlier = self.unclaimed
+        self.unclaimed = None
+        if earlier is not None and earlier["key"] == key:
+            # 就是上次沒等到的那一次：交出它的結果，不要再做一遍
+            return self._outcome(earlier)
+
+        rec = {"key": key, "tool": tool, "t0": time.monotonic()}
+        rec["fut"] = self.submit(tool, args)
+        self.inflight = rec
+        rec["fut"].add_done_callback(lambda f, r=rec: self._finished(r, f))
+        if not await self._wait(rec["fut"], deadline):
+            return self._still_running(rec)
+        result = self._outcome(rec)
+        if self.unclaimed is rec:
+            self.unclaimed = None
+        if earlier is not None and isinstance(result, dict):
+            try:
+                said = self._outcome(earlier)
+            except Exception as exc:                          # noqa: BLE001
+                said = {"error": "{}: {}".format(type(exc).__name__, exc)}
+            result = dict(result)
+            result["earlier_call"] = {
+                "tool": earlier["tool"],
+                "note": "先前沒等到結果的那次 {} 已經完成，這是它的回覆".format(earlier["tool"]),
+                "result": said}
+        return result
+
+
 # ── MCP stdio server ────────────────────────────────────────────────
 def serve_mcp() -> None:
     """把雲端的工具清單，以 MCP 介面提供給 Claude Desktop。"""
@@ -172,18 +284,23 @@ def serve_mcp() -> None:
     pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aspen",
                               initializer=_com_init)
 
+    def _submit(name, arguments):
+        return asyncio.get_running_loop().run_in_executor(
+            pool, agent.call, name, arguments)
+
+    gate = CallGate(_submit)
+
     @app.list_tools()
     async def _tools():
-        loop = asyncio.get_running_loop()
-        tools = await loop.run_in_executor(pool, agent.list_tools)
+        # 只是向雲端要清單，不碰 Aspen —— 不放進 Aspen 執行緒，免得排在一次
+        # 長的模擬後面，整個工具清單跟著逾時。
+        tools = await asyncio.to_thread(agent.list_tools)
         return [Tool(name=t["name"], description=t["description"],
                      inputSchema=t["inputSchema"]) for t in tools]
 
     @app.call_tool()
     async def _call(name: str, arguments: dict):
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            pool, agent.call, name, arguments or {})
+        result = await gate.call(name, arguments or {})
         return [TextContent(type="text",
                             text=json.dumps(result, ensure_ascii=False, indent=2))]
 
