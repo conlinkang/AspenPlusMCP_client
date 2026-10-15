@@ -15,11 +15,14 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bridge import Bridge, _aspen_pids  # noqa: E402
@@ -38,6 +41,98 @@ RETRY_S = (0.5, 1.0, 2.0, 3.0, 5.0)
 # 一次 MCP 工具呼叫最多讓用戶端等幾秒（見 CallGate）。Codex 預設 60 秒就判
 # 逾時，Claude Desktop 也有自己的上限；留一點餘裕。0 表示不限制。
 CALL_BUDGET_S = float(os.environ.get("ASPEN_CALL_BUDGET_S") or 45)
+
+
+# ── 工作日誌 ────────────────────────────────────────────────────────
+# MCP 走 stdin/stdout，這支程式印出來的東西沒有人看得到；用戶端說「逾時」
+# 的時候，事後完全查不出是哪一支工具、卡在哪一個動作、等了多久。每一次
+# 工具呼叫、每一個 Aspen 動作、每一次重試都記一行在本機。
+#
+# 一天一個檔（logs/agent-YYYY-MM-DD.log），保留 LOG_KEEP_DAYS 天。同一台電腦
+# 可能同時跑好幾個 agent（每開一個對話就一個），每一行都帶行程編號。
+# 不記 token。寫日誌失敗絕不影響工具呼叫。ASPEN_LOG=0 關閉。
+LOG_DIR = Path(os.environ.get("ASPEN_LOG_DIR")
+               or Path(os.path.dirname(os.path.abspath(__file__))) / "logs")
+LOG_KEEP_DAYS = 14
+_LOG_LOCK = threading.Lock()
+
+
+def _fmt(value, limit: int = 300) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "{:.2f}".format(value) if isinstance(value, float) else str(value)
+    plain = isinstance(value, str)
+    text = value if plain else json.dumps(value, ensure_ascii=False, default=str)
+    text = text.replace("\r", " ").replace("\n", " ")
+    if TOKEN and TOKEN in text:
+        text = text.replace(TOKEN, "<token>")
+    if len(text) > limit:
+        text = text[:limit] + "…(共 {} 字)".format(len(text))
+    # 有空白的字串加引號，一行裡的 key=value 才分得開
+    return json.dumps(text, ensure_ascii=False) if plain and (" " in text or not text) else text
+
+
+def log(event: str, **fields) -> None:
+    if os.environ.get("ASPEN_LOG") == "0":
+        return
+    try:
+        now = time.time()
+        line = "{}.{:03d} pid={} {}{}\n".format(
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            int(now * 1000) % 1000, os.getpid(), event,
+            "".join(" {}={}".format(k, _fmt(v)) for k, v in fields.items()
+                    if v is not None))
+        path = LOG_DIR / "agent-{}.log".format(time.strftime("%Y-%m-%d", time.localtime(now)))
+        with _LOG_LOCK:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+    except Exception:                                         # noqa: BLE001
+        pass
+
+
+def _prune_logs() -> None:
+    """刪掉超過 LOG_KEEP_DAYS 天的日誌（只動 agent-*.log）。"""
+    try:
+        cutoff = time.time() - LOG_KEEP_DAYS * 86400
+        for p in LOG_DIR.glob("agent-*.log"):
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+    except Exception:                                         # noqa: BLE001
+        pass
+
+
+def _client_version() -> str | None:
+    """學生端資料夾的 git 提交（用 git pull 更新的話才有）。"""
+    try:
+        r = subprocess.run(
+            ["git", "-C", os.path.dirname(os.path.abspath(__file__)), "log", "-1",
+             "--format=%h %cd", "--date=format:%Y-%m-%d %H:%M"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.stdout.strip() or None
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def _summary(result) -> dict:
+    """工具回覆裡值得記的幾個欄位，加上整份的大小。"""
+    if not isinstance(result, dict):
+        return {"type": type(result).__name__}
+    keep = ("error", "status", "ran", "converged", "opened", "still_running",
+            "busy", "running", "n_applied", "n_rejected", "complete", "interrupted",
+            "engine_stuck")
+    out = {k: result[k] for k in keep if k in result}
+    if "earlier_call" in result:
+        out["earlier_call"] = (result["earlier_call"] or {}).get("tool")
+    out["chars"] = len(json.dumps(result, ensure_ascii=False, default=str))
+    return out
+
+
+def _op_brief(op: str, args) -> str:
+    args = args or {}
+    if op == "batch":
+        return "{} 個動作".format(len(args.get("ops") or []))
+    return str(args.get("path") or args.get("action") or "")[:160]
 
 
 def _cloud_error(exc: urllib.error.HTTPError) -> RuntimeError:
@@ -73,24 +168,34 @@ def post(path: str, payload: dict, timeout: float = 60.0) -> dict:
                  "Authorization": "Bearer " + TOKEN})
     last = None
     for wait in RETRY_S + (None,):
+        t0 = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                out = json.loads(resp.read().decode("utf-8"))
+            took = time.monotonic() - t0
+            if took > 5:
+                log("cloud_slow", path=path, s=took)
+            return out
         except urllib.error.HTTPError as exc:
             # 雲端有回應、只是拒絕 —— 重試沒有意義，把它的說明轉出來
-            raise _cloud_error(exc) from None
+            err = _cloud_error(exc)
+            log("cloud_http_error", path=path, code=exc.code, said=str(err))
+            raise err from None
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", exc)
             refused = (isinstance(reason, ConnectionRefusedError)
                        or "10061" in str(reason)
                        or "refused" in str(reason).lower())
             if not refused or wait is None:
+                log("cloud_unreachable", path=path, refused=refused,
+                    reason=str(reason), s=time.monotonic() - t0)
                 if refused:
                     raise ConnectionError(
                         "連不上雲端 {}：連線被拒絕，已重試 {} 秒。伺服器可能"
                         "沒在跑或正在重啟；請稍後再試，或請管理者確認 8787 "
                         "有在監聽。".format(CLOUD, int(sum(RETRY_S)))) from exc
                 raise
+            log("cloud_refused_retry", path=path, wait_s=wait)
             last = exc
             time.sleep(wait)
     raise last  # 理論上到不了這裡
@@ -118,21 +223,47 @@ class Agent:
 
         本地永遠不知道下一步是什麼 —— 配方不落地，這是保護的關鍵。
         """
-        reply = post("/call", {"session": self.session, "tool": tool,
-                               "args": args, "token": TOKEN})
+        t0 = time.monotonic()
+        n_ops = 0
         self.rounds = 0
-        while reply.get("type") == "ops":
-            self.rounds += 1
-            if self.rounds > MAX_ROUNDS:
-                return {"error": "超過 {} 回合，雲端可能有迴圈".format(MAX_ROUNDS)}
-            results = []
-            for item in reply["ops"]:
-                self.ops_sent += 1
-                results.append(self.bridge.execute(item.get("op"),
-                                                   item.get("args")))
-            reply = post("/result", {"session": self.session,
-                                     "results": results, "token": TOKEN})
-        return reply.get("result", {})
+        log("call_start", session=self.session, tool=tool, args=args)
+        try:
+            reply = post("/call", {"session": self.session, "tool": tool,
+                                   "args": args, "token": TOKEN})
+            while reply.get("type") == "ops":
+                self.rounds += 1
+                if self.rounds > MAX_ROUNDS:
+                    log("call_end", tool=tool, s=time.monotonic() - t0,
+                        rounds=self.rounds, ops=n_ops, error="too_many_rounds")
+                    return {"error": "超過 {} 回合，雲端可能有迴圈".format(MAX_ROUNDS)}
+                results, names, t_round = [], [], time.monotonic()
+                for item in reply["ops"]:
+                    self.ops_sent += 1
+                    n_ops += 1
+                    op, op_args = item.get("op"), item.get("args")
+                    names.append(op)
+                    t_op = time.monotonic()
+                    res = self.bridge.execute(op, op_args)
+                    results.append(res)
+                    took = time.monotonic() - t_op
+                    ok = isinstance(res, dict) and res.get("ok")
+                    # 每個動作都記會太長：慢的、失敗的才單獨記一行
+                    if took >= 0.5 or not ok:
+                        log("op", tool=tool, round=self.rounds, op=op,
+                            target=_op_brief(op, op_args), s=took, ok=bool(ok),
+                            error=None if ok else (res or {}).get("error"))
+                log("round", tool=tool, round=self.rounds, ops=",".join(map(str, names)),
+                    s=time.monotonic() - t_round)
+                reply = post("/result", {"session": self.session,
+                                         "results": results, "token": TOKEN})
+        except Exception as exc:
+            log("call_failed", tool=tool, s=time.monotonic() - t0, rounds=self.rounds,
+                ops=n_ops, exception="{}: {}".format(type(exc).__name__, exc))
+            raise
+        result = reply.get("result", {})
+        log("call_end", tool=tool, s=time.monotonic() - t0, rounds=self.rounds,
+            ops=n_ops, result=_summary(result))
+        return result
 
     def shutdown(self) -> None:
         try:
@@ -175,6 +306,9 @@ class CallGate:
             self.inflight = None
         if not rec.get("claimed"):
             self.unclaimed = rec
+            if rec.get("abandoned"):        # 用戶端已經拿到 still_running、走掉了
+                log("gate_finished_unclaimed", tool=rec["tool"],
+                    s=rec["done_at"] - rec["t0"])
 
     async def _wait(self, fut, deadline):
         """等到 fut 完成回 True；過了 deadline 回 False（fut 照樣繼續跑）。"""
@@ -199,6 +333,8 @@ class CallGate:
 
     def _still_running(self, rec: dict) -> dict:
         took = int(time.monotonic() - rec["t0"])
+        rec["abandoned"] = True
+        log("gate_still_running", tool=rec["tool"], elapsed_s=took)
         return {
             "still_running": True, "tool": rec["tool"], "elapsed_s": took,
             "note": ("{0} 還在 Aspen 裡進行（已 {1} 秒），沒有中斷。為了不讓用戶端判逾時，"
@@ -208,6 +344,7 @@ class CallGate:
 
     def _busy(self, rec: dict, tool: str) -> dict:
         took = int(time.monotonic() - rec["t0"])
+        log("gate_busy", refused=tool, running=rec["tool"], elapsed_s=took)
         return {
             "busy": True, "running": rec["tool"], "elapsed_s": took,
             "error": ("上一個呼叫 {0} 還在 Aspen 裡進行（已 {1} 秒）。Aspen 一次只能做一件"
@@ -225,6 +362,7 @@ class CallGate:
         self.unclaimed = None
         if earlier is not None and earlier["key"] == key:
             # 就是上次沒等到的那一次：交出它的結果，不要再做一遍
+            log("gate_delivered_earlier", tool=tool)
             return self._outcome(earlier)
 
         rec = {"key": key, "tool": tool, "t0": time.monotonic()}
@@ -242,6 +380,7 @@ class CallGate:
             except Exception as exc:                          # noqa: BLE001
                 said = {"error": "{}: {}".format(type(exc).__name__, exc)}
             result = dict(result)
+            log("gate_attached_earlier", tool=tool, earlier=earlier["tool"])
             result["earlier_call"] = {
                 "tool": earlier["tool"],
                 "note": "先前沒等到結果的那次 {} 已經完成，這是它的回覆".format(earlier["tool"]),
@@ -259,6 +398,10 @@ def serve_mcp() -> None:
     from mcp.server.stdio import stdio_server
     from mcp.types import TextContent, Tool
 
+    _prune_logs()
+    log("agent_start", cloud=CLOUD, client=_client_version(),
+        python=sys.version.split()[0], budget_s=CALL_BUDGET_S,
+        parent_pid=os.getppid())
     agent = Agent()
     app = Server("aspen-agent")
 
@@ -294,13 +437,26 @@ def serve_mcp() -> None:
     async def _tools():
         # 只是向雲端要清單，不碰 Aspen —— 不放進 Aspen 執行緒，免得排在一次
         # 長的模擬後面，整個工具清單跟著逾時。
-        tools = await asyncio.to_thread(agent.list_tools)
+        try:
+            tools = await asyncio.to_thread(agent.list_tools)
+        except Exception as exc:
+            log("list_tools_failed", exception="{}: {}".format(type(exc).__name__, exc))
+            raise
+        log("list_tools", n=len(tools))
         return [Tool(name=t["name"], description=t["description"],
                      inputSchema=t["inputSchema"]) for t in tools]
 
     @app.call_tool()
     async def _call(name: str, arguments: dict):
-        result = await gate.call(name, arguments or {})
+        # 用戶端實際等了多久：和 call_end 的秒數不同時，差的就是排隊或 still_running
+        t0 = time.monotonic()
+        try:
+            result = await gate.call(name, arguments or {})
+        except Exception as exc:
+            log("mcp_error", tool=name, s=time.monotonic() - t0,
+                exception="{}: {}".format(type(exc).__name__, exc))
+            raise
+        log("mcp_reply", tool=name, s=time.monotonic() - t0, result=_summary(result))
         return [TextContent(type="text",
                             text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -310,7 +466,12 @@ def serve_mcp() -> None:
 
     try:
         asyncio.run(main())
+    except BaseException as exc:
+        log("agent_crashed", exception="{}: {}".format(type(exc).__name__, exc))
+        raise
     finally:
+        log("agent_stop", ops_sent=agent.ops_sent,
+            busy_with=(gate.inflight or {}).get("tool"))
         # 關閉也要在同一個執行緒上做，否則 COM 物件會在錯的 apartment 被釋放
         try:
             pool.submit(agent.shutdown).result(timeout=30)
