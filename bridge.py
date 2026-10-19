@@ -2148,6 +2148,202 @@ class Bridge:
         time.sleep(secs)
         return _ok({"slept": secs})
 
+    # ══ 元件資料庫（唯讀）═══════════════════════════════════════════
+    # Aspen 把物性資料庫（APV140 等）放在自己的 SQL Server LocalDB 執行個體
+    # （AspenInstance40＝V14、AspenInstance41＝V15…，一個 Aspen 版本一個）。
+    # Aspen 開著的時候，那個執行個體是 Aspen 自己用 sqlservr.exe 啟動的，
+    # 用 LocalDB 的名稱（(localdb)\AspenInstance40）連會失敗（"SQL Server
+    # 處理序無法啟動"），但直接連它的具名管道可以。所以做法是：找出正在跑的
+    # sqlservr.exe、從命令列取出管道名稱、用 Windows 內建的 SQLOLEDB 驅動
+    # 經 ADO 連上去 —— 不需要額外安裝任何套件。只執行這裡寫死的 SELECT，
+    # 使用者的文字一律當參數，不會拼進 SQL。
+    _DB_CACHE: dict = {}
+
+    @staticmethod
+    def _db_pipe_candidates() -> list:
+        """正在跑的 Aspen LocalDB 執行個體：[(執行個體編號, 管道名稱), ...]。"""
+        import re
+        import win32com.client as w32
+        bs = chr(92)
+        found = []
+        wmi = w32.GetObject("winmgmts:")
+        for proc in wmi.ExecQuery("select CommandLine from Win32_Process where Name='sqlservr.exe'"):
+            cmd = proc.CommandLine or ""
+            pipe = re.search(r"-sLOCALDB#([0-9A-Fa-f]+)", cmd)
+            inst = re.search(r"AspenInstance(\d+)", cmd)
+            if pipe and inst:
+                found.append((inst.group(1), "np:" + bs + bs + "." + bs + "pipe" + bs + "LOCALDB#"
+                              + pipe.group(1) + bs + "tsql" + bs + "query"))
+        return found
+
+    def _wanted_instance(self) -> str | None:
+        """要用哪一版 Aspen 的資料庫：這份橋接層連的那一版（ProgID 的編號）。"""
+        import re
+        m = re.search(r"Apwn\.Document\.(\d+)", self._progid or "")
+        if m:
+            return m.group(1)
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "Apwn.Document" + chr(92) + "CurVer") as k:
+                m = re.search(r"Apwn\.Document\.(\d+)", str(winreg.QueryValue(k, None)))
+                return m.group(1) if m else None
+        except OSError:
+            return None
+
+    def _db_connect(self):
+        """回傳 (ADO 連線, 資料庫名稱, 執行個體編號)；失敗丟 RuntimeError(原因)。"""
+        import win32com.client as w32
+        cands = self._db_pipe_candidates()
+        if not cands:
+            raise RuntimeError(
+                "Aspen's component database is not running: it is started "
+                "together with Aspen, so open or create a model first "
+                "(open_project / new_project) and try again")
+        want = self._wanted_instance()
+        pick = next((c for c in cands if c[0] == want), None)
+        if pick is None:
+            if want:
+                # 版本不同、資料庫內容也不同：寧可說連不上，也不拿別版的資料騙人
+                raise RuntimeError(
+                    "No component database is running for this Aspen version "
+                    "({}); running: {}".format(want, ", ".join(c[0] for c in cands)))
+            pick = cands[0]
+        cached = Bridge._DB_CACHE.get(pick[1])
+        if cached is not None:
+            try:
+                if cached[0].State == 1:
+                    return cached[0], cached[1], pick[0]
+            except Exception:
+                pass
+            Bridge._DB_CACHE.pop(pick[1], None)
+        last = None
+        for prov in ("SQLOLEDB", "MSOLEDBSQL"):
+            conn = w32.Dispatch("ADODB.Connection")
+            conn.ConnectionTimeout = 15
+            text = ("Provider=" + prov + ";Data Source=" + pick[1]
+                    + ";Integrated Security=SSPI;")
+            if prov == "MSOLEDBSQL":
+                text += "Use Encryption for Data=Optional;"
+            try:
+                conn.Open(text)
+            except Exception as exc:
+                last = repr(exc)[:160]
+                continue
+            rs = conn.Execute("select name from sys.databases where name like 'APV[0-9]%'")[0]
+            names = []
+            while not rs.EOF:
+                names.append(rs.Fields(0).Value)
+                rs.MoveNext()
+            if not names:
+                conn.Close()
+                raise RuntimeError("The Aspen SQL instance has no APV<version> pure-component database")
+            conn.Execute("use [" + names[0] + "]")
+            Bridge._DB_CACHE[pick[1]] = (conn, names[0])
+            return conn, names[0], pick[0]
+        raise RuntimeError("Could not open Aspen's component database: " + str(last))
+
+    @staticmethod
+    def _db_rows(conn, sql: str, params: list) -> list:
+        """參數化查詢（ADO，位置參數 ?）。整數與字串兩種。"""
+        import win32com.client as w32
+        cmd = w32.Dispatch("ADODB.Command")
+        cmd.ActiveConnection = conn
+        cmd.CommandText = sql
+        for i, val in enumerate(params):
+            if isinstance(val, int):
+                cmd.Parameters.Append(cmd.CreateParameter("p%d" % i, 3, 1, 0, val))
+            else:
+                cmd.Parameters.Append(cmd.CreateParameter("p%d" % i, 202, 1, 200, str(val)))
+        rs = cmd.Execute()[0]
+        rows = []
+        while not rs.EOF:
+            rows.append([rs.Fields(k).Value for k in range(rs.Fields.Count)])
+            rs.MoveNext()
+        return rows
+
+    def component_search(self, query: str, limit: int = 10) -> dict:
+        """在 Aspen 的物性資料庫裡找元件：名稱、分子式、CAS 號、別名都可以。
+
+        排序：完全相同的名稱 → 完全相同的分子式或 CAS → 完全相同的別名 →
+        名稱開頭 → 分子式開頭 → 名稱包含 → 其他別名包含。另外把 - 空白 _ 拿掉
+        再比一次（名稱完全相同也算排第一），所以 NPENTANE、n pentane 找得到 N-PENTANE。
+        """
+        text = str(query or "").strip()
+        if not text:
+            return _err("BAD_ARGS", "query is empty")
+        text = text[:80]
+        limit = max(1, min(int(limit), 25))
+        if not any(ch not in "- _" for ch in text):
+            return _err("BAD_ARGS", "query has no letters or digits")
+        try:
+            conn, dbname, inst = self._db_connect()
+        except RuntimeError as exc:
+            return _err("DB_UNAVAILABLE", str(exc))
+        except Exception as exc:
+            return _err("DB_UNAVAILABLE", "Could not reach Aspen's component database: " + repr(exc)[:160])
+
+        def like_escape(s: str) -> str:
+            return s.replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
+
+        plain = like_escape(text)
+        squeezed = like_escape("".join(ch for ch in text if ch not in "- _"))
+        v = "identifierValue"
+        sq = "replace(replace(replace(identifierValue,'-',''),' ',''),'_','')"
+        rank = (
+            "case when identifierName='NAME' and (" + v + " like ? or " + sq + " like ?) then 0 "
+            "when identifierName in ('ALIAS','CASRN') and " + v + " like ? then 1 "
+            "when identifierName='SYNONYM' and " + v + " like ? then 2 "
+            "when identifierName='NAME' and " + v + " like ? then 3 "
+            "when identifierName='ALIAS' and " + v + " like ? then 4 "
+            "when identifierName='NAME' and " + v + " like ? then 5 "
+            "when identifierName='NAME' and " + sq + " like ? then 5 "
+            "else 6 end")
+        sql = (
+            "select top (?) compoundId, min(r) from ("
+            "select compoundId, " + rank + " as r from CompoundsIdentifiers "
+            "where identifierName in ('NAME','ALIAS','CASRN','SYNONYM') and ("
+            + v + " like ? or " + sq + " like ?)) t "
+            "group by compoundId order by min(r), compoundId")
+        try:
+            params = [limit + 1, plain, squeezed, plain, plain, plain + "%", plain + "%", "%" + plain + "%",
+                      "%" + squeezed + "%", "%" + plain + "%", "%" + squeezed + "%"]
+            hits = self._db_rows(conn, sql, params)
+            more = len(hits) > limit
+            hits = hits[:limit]
+            ids = [int(h[0]) for h in hits]
+            out = []
+            if ids:
+                inlist = ",".join(str(i) for i in ids)          # 整數，不是使用者的文字
+                idrows = self._db_rows(
+                    conn, "select compoundId, identifierName, identifierValue from CompoundsIdentifiers "
+                    "where compoundId in (" + inlist + ") and identifierName in ('NAME','ALIAS','CASRN','SYNONYM') "
+                    "order by compoundId, identifierIndex", [])
+                banks = self._db_rows(
+                    conn, "select distinct p.compoundId, d.dbName from DatabankCompoundsIdentifiersPure p "
+                    "join Databanks d on d.dbId = p.databankIndex where p.compoundId in (" + inlist + ")", [])
+                info: dict = {i: {"name": None, "formula": None, "cas": None, "synonyms": [], "databanks": []} for i in ids}
+                for cid, kind, val in idrows:
+                    rec = info[int(cid)]
+                    if kind == "NAME":
+                        rec["name"] = val
+                    elif kind == "ALIAS":
+                        rec["formula"] = val
+                    elif kind == "CASRN":
+                        rec["cas"] = val
+                    elif len(rec["synonyms"]) < 6:
+                        rec["synonyms"].append(val)
+                for cid, bank in banks:
+                    info[int(cid)]["databanks"].append(bank)
+                for h in hits:
+                    rec = info[int(h[0])]
+                    rec["match_rank"] = int(h[1])
+                    out.append(rec)
+        except Exception as exc:
+            Bridge._DB_CACHE.clear()
+            return _err("DB_ERROR", repr(exc)[:200])
+        return _ok({"query": text, "database": dbname, "instance": inst, "matches": out,
+                    "count": len(out), "more": more})
+
     # ══ 派送 ════════════════════════════════════════════════════════
     OPS = (
         "connect", "create_file", "open_file", "save", "close", "app_prop",
@@ -2156,7 +2352,7 @@ class Bridge:
         "run", "run_status", "reinit", "get_log",
         "ui_tree", "ui_find", "ui_wait", "ui_act", "sleep", "read_table",
         "clock", "fs_wait", "fs_list", "fs_read_text", "proc_status",
-        "ui_modal_dialogs",
+        "ui_modal_dialogs", "component_search",
     )
 
     def execute(self, op: str, args: dict | None = None) -> dict:
