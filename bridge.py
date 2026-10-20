@@ -15,6 +15,8 @@ import glob
 import io
 import os
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -2344,6 +2346,180 @@ class Bridge:
         return _ok({"query": text, "database": dbname, "instance": inst, "matches": out,
                     "count": len(out), "more": more})
 
+    # ══ 問題回報要帶回的資料（2026-10-20）═════════════════════════════
+    # 回報送到雲端之後，管理者看不到學生的電腦。以前真正卡住處理的是缺資訊：agent 日誌、
+    # bridge／agent 是哪一版、有幾個 AspenPlus 行程、事件記錄裡的崩潰、出問題的模型檔。
+    # report_env 把前幾項收成一份快照；report_file 把模型檔分段送回去（學生同意才會被叫到）。
+    _REPORT_EXT = (".bkp", ".apw", ".apwz", ".inp")
+    _REPORT_MAX_BYTES = 40 * 1024 * 1024
+    _REPORT_CHUNK_MAX = 1500000
+
+    @staticmethod
+    def _file_facts(path: str) -> dict:
+        import hashlib
+        facts = {"file": os.path.basename(path)}
+        try:
+            st = os.stat(path)
+            facts.update(size=st.st_size, mtime=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)))
+            with open(path, "rb") as fh:
+                facts["sha1"] = hashlib.sha1(fh.read()).hexdigest()
+        except OSError as exc:
+            facts["error"] = repr(exc)[:80]
+        return facts
+
+    @staticmethod
+    def _log_tail(lines: int) -> tuple:
+        """agent 的工作日誌最後幾行（今天的，沒有就最近的一份）。回 (檔名, 文字, 日誌檔清單)。"""
+        folder = os.environ.get("ASPEN_LOG_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        try:
+            names = sorted(n for n in os.listdir(folder) if n.startswith("agent-") and n.endswith(".log"))
+        except OSError:
+            return None, "", []
+        if not names:
+            return None, "", []
+        today = "agent-{}.log".format(time.strftime("%Y-%m-%d"))
+        pick = today if today in names else names[-1]
+        try:
+            with open(os.path.join(folder, pick), "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 200000))
+                text = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return pick, "", names[-5:]
+        return pick, "\n".join(text.splitlines()[-max(1, min(int(lines), 400)):]), names[-5:]
+
+    @staticmethod
+    def _recent_aspen_crashes() -> list:
+        """事件記錄（應用程式、事件 1000）最近 24 小時 Aspen 相關的崩潰：時間、程式、模組、例外碼。"""
+        import subprocess
+        import xml.etree.ElementTree as ET
+        try:
+            out = subprocess.run(
+                ["wevtutil", "qe", "Application", "/q:*[System[(EventID=1000) and TimeCreated[timediff(@SystemTime) <= 86400000]]]",
+                 "/c:80", "/rd:true", "/f:xml"],
+                capture_output=True, timeout=12, creationflags=0x08000000).stdout.decode("utf-8", errors="replace")
+        except Exception:
+            return []
+        found = []
+        try:
+            root = ET.fromstring("<root>" + out + "</root>")
+        except ET.ParseError:
+            return []
+        ns = "{http://schemas.microsoft.com/win/2004/08/events/event}"
+        for ev in root.iter(ns + "Event"):
+            data = [(d.text or "") for d in ev.iter(ns + "Data")]
+            if len(data) < 7 or "aspen" not in data[0].lower():
+                continue
+            stamp = ev.find(ns + "System/" + ns + "TimeCreated")
+            found.append({"time": (stamp.get("SystemTime") if stamp is not None else "")[:19], "app": data[0],
+                          "module": data[3], "code": data[6]})
+            if len(found) >= 15:
+                break
+        return found
+
+    def report_env(self, log_lines: int = 60, crashes: bool = False) -> dict:
+        import platform
+        here = os.path.dirname(os.path.abspath(__file__))
+        env = {"bridge": self._file_facts(os.path.abspath(__file__)),
+               "agent": self._file_facts(os.path.join(here, "agent.py")),
+               "python": sys.version.split()[0], "platform": platform.platform(),
+               "session_name": os.environ.get("SESSIONNAME"), "temp_dir": tempfile.gettempdir(),
+               "model_path": self._path}
+        try:
+            import ctypes
+            lang = int(ctypes.windll.kernel32.GetUserDefaultUILanguage())
+            env["ui_language"] = "0x{:04x}".format(lang)
+        except Exception:
+            env["ui_language"] = None
+        aspen = {"progid": self._progid, "connected": self.app is not None, "pid": self._pid}
+        if self.app is not None:
+            try:
+                aspen["visible"] = bool(self.app.Visible)
+            except Exception as exc:
+                aspen["visible"] = "error: " + repr(exc)[:60]
+        env["aspen"] = aspen
+        procs = []
+        try:
+            import win32com.client as w32
+            for pr in w32.GetObject("winmgmts:").ExecQuery(
+                    "select ProcessId, CreationDate, SessionId, CommandLine from Win32_Process where Name='AspenPlus.exe'"):
+                procs.append({"pid": pr.ProcessId, "created": str(pr.CreationDate)[:14], "session_id": pr.SessionId,
+                              "command_tail": (pr.CommandLine or "")[-70:]})
+        except Exception as exc:
+            procs = [{"error": repr(exc)[:80]}]
+        env["aspen_processes"] = procs
+        name, tail, names = self._log_tail(log_lines)
+        env["log_file"], env["log_tail"], env["log_files"] = name, tail, names
+        if crashes:
+            env["crashes"] = self._recent_aspen_crashes()
+        return _ok(env)
+
+    def report_file(self, path: str, offset: int = 0, length: int = 1048576, delete_after: bool = False) -> dict:
+        """把一個檔案的一段（base64）送回去。只有兩種檔案可以讀：目前開著的模型檔，
+        和回報流程自己匯出到暫存資料夾的副本（檔名 aspen_report_ 開頭）。副檔名也有白名單、
+        大小有上限。其他一律拒絕 —— 這個動作不是讓雲端隨便取學生電腦上的檔案。"""
+        import base64
+        import hashlib
+        try:
+            p = os.path.abspath(os.path.expandvars(str(path)))
+        except Exception:
+            return _err("FS_FORBIDDEN", "bad path")
+        tmp = os.path.abspath(tempfile.gettempdir())
+        is_snapshot = (os.path.normcase(os.path.dirname(p)) == os.path.normcase(tmp)
+                       and os.path.basename(p).lower().startswith("aspen_report_"))
+        is_open = bool(self._path) and os.path.normcase(p) == os.path.normcase(os.path.abspath(self._path))
+        if os.path.splitext(p)[1].lower() not in self._REPORT_EXT or not (is_snapshot or is_open):
+            return _err("FS_FORBIDDEN", "only the open model file or this report's own snapshot can be read")
+        if not os.path.isfile(p):
+            if delete_after and is_snapshot:
+                side = os.path.splitext(p)[0] + "Cost"
+                if os.path.isdir(side):
+                    import shutil
+                    shutil.rmtree(side, ignore_errors=True)
+            return _err("FILE_NOT_FOUND", p)
+        if is_snapshot and int(offset) == 0:
+            # Aspen 有時在 Export 返回後才把檔寫完：等大小不再變動（最多 4 秒）再算 sha256
+            last = -1
+            for _ in range(8):
+                now = os.path.getsize(p)
+                if now == last:
+                    break
+                last = now
+                time.sleep(0.5)
+        size = os.path.getsize(p)
+        if size > self._REPORT_MAX_BYTES:
+            return _err("FILE_TOO_LARGE", "{} bytes; the limit is {}".format(size, self._REPORT_MAX_BYTES))
+        offset = max(0, int(offset))
+        length = max(0, min(int(length), self._REPORT_CHUNK_MAX))
+        out = {"path": p, "size": size, "offset": offset}
+        try:
+            if offset == 0:
+                h = hashlib.sha256()
+                with open(p, "rb") as fh:
+                    for block in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(block)
+                out["sha256"] = h.hexdigest()
+            with open(p, "rb") as fh:
+                fh.seek(offset)
+                chunk = fh.read(length)
+        except OSError as exc:
+            return _err("COM_ERROR", repr(exc))
+        out["data"] = base64.b64encode(chunk).decode("ascii")
+        out["eof"] = offset + len(chunk) >= size
+        if delete_after and is_snapshot and out["eof"] or (delete_after and is_snapshot and length == 0):
+            try:
+                os.remove(p)
+                out["deleted"] = True
+            except OSError:
+                out["deleted"] = False
+            # Aspen 匯出時會在旁邊留一個「<檔名>Cost」資料夾（實測 2026-10-20），是匯出的副產品，一起清掉
+            side = os.path.splitext(p)[0] + "Cost"
+            if os.path.isdir(side) and os.path.basename(side).lower().startswith("aspen_report_"):
+                import shutil
+                shutil.rmtree(side, ignore_errors=True)
+        return _ok(out)
+
     # ══ 派送 ════════════════════════════════════════════════════════
     OPS = (
         "connect", "create_file", "open_file", "save", "close", "app_prop",
@@ -2352,7 +2528,7 @@ class Bridge:
         "run", "run_status", "reinit", "get_log",
         "ui_tree", "ui_find", "ui_wait", "ui_act", "sleep", "read_table",
         "clock", "fs_wait", "fs_list", "fs_read_text", "proc_status",
-        "ui_modal_dialogs", "component_search",
+        "ui_modal_dialogs", "component_search", "report_env", "report_file",
     )
 
     def execute(self, op: str, args: dict | None = None) -> dict:
