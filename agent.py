@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -101,6 +103,139 @@ def _prune_logs() -> None:
         pass
 
 
+# ── 自己檢查有沒有新版，經學生同意才更新 ──────────────────────────────────
+# 伺服器手上有一份 client_manifest.json（每個學生端檔案的指紋）。agent.py 啟動時、也隨時能問
+# （MCP 工具 client_status）：本機的檔案和課程目前的版本一樣嗎。不一樣的話，Claude 先問學生要不要更新，
+# 學生同意了才呼叫 client_update(confirm=true)：
+#   - 這個資料夾是 git 複本、沒有本機修改 → git pull --ff-only；
+#   - 否則從課程的公開倉庫下載有變的檔案；
+#   兩條路都用伺服器 manifest 的指紋核對，核對不過就整個不換（倉庫還沒跟上課程版本時會這樣）。
+# 換完要完全關閉 Claude 再開：正在跑的 agent.py 不會自己重新載入。
+HERE = os.path.dirname(os.path.abspath(__file__))
+RAW_BASE = os.environ.get("ASPEN_CLIENT_RAW_BASE",
+                          "https://raw.githubusercontent.com/conlinkang/AspenPlusMCP_client/master/")
+UPDATE_STATE: dict = {}
+
+
+def _fp(path: str) -> str | None:
+    """檔案的 sha1（完整 40 碼，換行字元統一成 LF）；檔案不在回 None。"""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha1(fh.read().replace(b"\r\n", b"\n")).hexdigest()
+    except OSError:
+        return None
+
+
+def fetch_manifest(timeout: float = 8.0) -> dict:
+    """向課程伺服器要目前的版本表。"""
+    return post("/client", {"token": TOKEN}, timeout=timeout, retry=False)
+
+
+def client_status() -> dict:
+    """本機的檔案和課程目前的版本一樣嗎。只查不改。"""
+    try:
+        m = fetch_manifest()
+    except Exception as exc:                                  # noqa: BLE001
+        return {"checked": False,
+                "error": "Could not ask the course server for the current version: {}".format(exc)}
+    files = m.get("files") or {"agent.py": m.get("agent"), "bridge.py": m.get("bridge")}
+    changed = [name for name, want in files.items() if want and _fp(os.path.join(HERE, name)) != want]
+    is_git = os.path.isdir(os.path.join(HERE, ".git"))
+    out = {"checked": True, "up_to_date": not changed, "changed_files": changed,
+           "yours": CLIENT_ID, "latest": "{}.{}".format(str(m.get("agent"))[:10], str(m.get("bridge"))[:10]),
+           "git_clone": is_git}
+    if changed:
+        out["next"] = ("Ask the student whether to update now. If they agree, call client_update with confirm=true; "
+                       "it {} and checks the result against the course version. They then close Claude completely "
+                       "and reopen it.".format("runs git pull in this folder" if is_git else "downloads the changed files"))
+    return out
+
+
+def _run_git(*args, timeout: float = 60.0):
+    return subprocess.run(["git", "-C", HERE, *args], capture_output=True, text=True, timeout=timeout,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def client_update(confirm=False) -> dict:
+    """把本機的檔案換成課程目前的版本。一定要學生同意（confirm=true）。"""
+    if confirm is not True:
+        return {"updated": False,
+                "error": "Not done: ask the student first, then call client_update with confirm=true."}
+    try:
+        m = fetch_manifest()
+    except Exception as exc:                                  # noqa: BLE001
+        return {"updated": False, "error": "Could not ask the course server for the current version: {}".format(exc)}
+    files = m.get("files") or {"agent.py": m.get("agent"), "bridge.py": m.get("bridge")}
+    changed = [name for name, want in files.items() if want and _fp(os.path.join(HERE, name)) != want]
+    if not changed:
+        return {"updated": False, "up_to_date": True, "note": "Already the course version; nothing to do."}
+    needs_pip = "requirements.txt" in changed
+    tail = {"restart_required": True,
+            "next": "Tell the student to close Claude completely and open it again" + (
+                "; requirements.txt changed, so also run: python -m pip install -r requirements.txt" if needs_pip else "")}
+
+    if os.path.isdir(os.path.join(HERE, ".git")):
+        try:
+            dirty = _run_git("status", "--porcelain", "--untracked-files=no").stdout.strip()
+            if dirty:
+                return {"updated": False, "method": "git pull",
+                        "error": "This folder is a git copy with local changes, so git pull was not run (it could overwrite "
+                                 "them). Save or discard the changes ({}), then try again.".format(dirty.replace("\n", "; ")[:200])}
+            old = _run_git("rev-parse", "HEAD").stdout.strip()
+            pulled = _run_git("pull", "--ff-only")
+            if pulled.returncode != 0:
+                return {"updated": False, "method": "git pull", "error": "git pull failed: {}".format(
+                    (pulled.stderr or pulled.stdout).strip()[:300])}
+            still = [n for n, want in files.items() if want and _fp(os.path.join(HERE, n)) != want]
+            if still:
+                if old:
+                    _run_git("reset", "--hard", old)
+                return {"updated": False, "method": "git pull",
+                        "error": "After git pull these files still differ from the course version: {}. The repository "
+                                 "is not up to date with the course server yet; nothing was changed. Ask the "
+                                 "administrator.".format(", ".join(still))}
+            return dict({"updated": True, "method": "git pull", "files": changed}, **tail)
+        except Exception as exc:                              # noqa: BLE001
+            return {"updated": False, "method": "git pull", "error": "{}: {}".format(type(exc).__name__, exc)}
+
+    # git 複本以外：下載有變的檔案，全部核對過才換
+    import tempfile
+    got = {}
+    try:
+        for name in changed:
+            req = urllib.request.Request(RAW_BASE + name, headers={"User-Agent": "aspen-agent"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+            if hashlib.sha1(data.replace(b"\r\n", b"\n")).hexdigest() != files[name]:
+                return {"updated": False, "method": "download",
+                        "error": "{} from the repository does not match the course version, so nothing was changed. The "
+                                 "repository is not up to date with the course server yet; ask the "
+                                 "administrator.".format(name)}
+            got[name] = data
+    except Exception as exc:                                  # noqa: BLE001
+        return {"updated": False, "method": "download", "error": "Download failed: {}: {}".format(type(exc).__name__, exc)}
+    backup = os.path.join(HERE, "client_backup", time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(backup, exist_ok=True)
+    for name, data in got.items():
+        target = os.path.join(HERE, name)
+        if os.path.exists(target):
+            shutil.copy2(target, os.path.join(backup, name))
+        tmp = target + ".new"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, target)
+    return dict({"updated": True, "method": "download", "files": changed, "backup": backup}, **tail)
+
+
+def _startup_check() -> None:
+    """agent 一啟動就在背景問一次，結果寫進日誌；查不到不影響任何事。"""
+    try:
+        UPDATE_STATE.update(client_status())
+        log("client_status", **{k: v for k, v in UPDATE_STATE.items() if k != "next"})
+    except Exception as exc:                                  # noqa: BLE001
+        log("client_status_failed", exception="{}: {}".format(type(exc).__name__, exc))
+
+
 def _client_version() -> str | None:
     """學生端資料夾的 git 提交（用 git pull 更新的話才有）。"""
     try:
@@ -162,14 +297,32 @@ def _cloud_error(exc: urllib.error.HTTPError) -> RuntimeError:
     return RuntimeError("The cloud server responded HTTP {}: {}".format(exc.code, said or exc.reason))
 
 
-def post(path: str, payload: dict, timeout: float = 60.0) -> dict:
+def client_id() -> str:
+    """這份 agent.py 和旁邊的 bridge.py 的指紋（sha1 前 10 碼，換行字元統一成 LF 再算）。
+    每次請求都帶給雲端，雲端用它認得學生端的檔案是不是課程目前的版本，太舊就提醒去下載。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = []
+    for name in ("agent.py", "bridge.py"):
+        try:
+            with open(os.path.join(here, name), "rb") as fh:
+                out.append(hashlib.sha1(fh.read().replace(b"\r\n", b"\n")).hexdigest()[:10])
+        except OSError:
+            out.append("none")
+    return ".".join(out)
+
+
+CLIENT_ID = client_id()
+
+
+def post(path: str, payload: dict, timeout: float = 60.0, retry: bool = True) -> dict:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         CLOUD + path, data=body,
         headers={"Content-Type": "application/json",
-                 "Authorization": "Bearer " + TOKEN})
+                 "Authorization": "Bearer " + TOKEN,
+                 "X-Aspen-Client": CLIENT_ID})
     last = None
-    for wait in RETRY_S + (None,):
+    for wait in (RETRY_S if retry else ()) + (None,):
         t0 = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -411,6 +564,7 @@ def serve_mcp() -> None:
     from mcp.types import TextContent, Tool
 
     _prune_logs()
+    threading.Thread(target=_startup_check, name="client-check", daemon=True).start()
     log("agent_start", cloud=CLOUD, client=_client_version(),
         python=sys.version.split()[0], budget_s=CALL_BUDGET_S,
         parent_pid=os.getppid())
@@ -456,12 +610,18 @@ def serve_mcp() -> None:
             raise
         log("list_tools", n=len(tools))
         return [Tool(name=t["name"], description=t["description"],
-                     inputSchema=t["inputSchema"]) for t in tools]
+                     inputSchema=t["inputSchema"]) for t in tools] + [
+            Tool(name=t["name"], description=t["description"], inputSchema=t["inputSchema"]) for t in LOCAL_TOOLS]
 
     @app.call_tool()
     async def _call(name: str, arguments: dict):
         # 用戶端實際等了多久：和 call_end 的秒數不同時，差的就是排隊或 still_running
         t0 = time.monotonic()
+        if name in LOCAL_HANDLERS:
+            # 不經雲端、不碰 Aspen 的本地工具：不排在 Aspen 執行緒後面（長模擬跑著也問得到有沒有新版）
+            result = await asyncio.to_thread(LOCAL_HANDLERS[name], arguments or {})
+            log("local_tool", tool=name, result=_summary(result))
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
         try:
             result = await gate.call(name, arguments or {})
         except Exception as exc:
@@ -562,7 +722,32 @@ def selftest(bkp: str) -> int:
         agent.shutdown()
 
 
+LOCAL_TOOLS = (
+    {"name": "client_status",
+     "description": ("[Client] Check whether the agent.py/bridge.py on this computer are the course's current version. "
+                     "Only asks the course server; changes nothing. Call it when a tool reply says client_update or "
+                     "client_outdated, when a long call keeps timing out, or when the student asks about updates."),
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "client_update",
+     "description": ("[Client] Update agent.py/bridge.py on this computer to the course's current version. Ask the student "
+                     "first and pass confirm=true ONLY after they agreed. It runs git pull when this folder is a git copy "
+                     "without local changes, otherwise downloads the changed files; either way the result is checked "
+                     "against the course server and nothing is changed if it does not match. Afterwards the student "
+                     "must close Claude completely and open it again."),
+     "inputSchema": {"type": "object", "properties": {
+         "confirm": {"type": "boolean", "description": "true only after the student said yes"}},
+         "required": ["confirm"]}},
+)
+LOCAL_HANDLERS = {"client_status": lambda args: client_status(),
+                  "client_update": lambda args: client_update(args.get("confirm"))}
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--selftest":
         raise SystemExit(selftest(sys.argv[2]))
+    if len(sys.argv) > 1 and sys.argv[1] in ("--check-update", "--update"):
+        # 自己在終端機執行就是同意：python agent.py --check-update 只查；--update 真的更新
+        out = client_update(True) if sys.argv[1] == "--update" else client_status()
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        raise SystemExit(0 if out.get("updated") or out.get("up_to_date") or out.get("checked") else 1)
     serve_mcp()
