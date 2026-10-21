@@ -838,6 +838,53 @@ class Bridge:
         except Exception as exc:
             return _err("COM_ERROR", repr(exc))
 
+    def engine_files(self, field: str = "LINKEROPT", value=None,
+                     write: bool = False) -> dict:
+        """Read/write the Linker Options indexed engine property (enum 9).
+
+        V14 stores it as `submitdata dlopt` in the backup, outside Data.
+        A write explicitly distinguishes clearing (None) from reading.
+        """
+        if self.app is None:
+            return _err("NOT_CONNECTED")
+        if field != "LINKEROPT":
+            return _err("BAD_ARG", "only LINKEROPT is supported")
+        desired = None
+        if write:
+            if value is None:
+                desired = ""
+            elif not isinstance(value, str) or not value.strip():
+                return _err("BAD_ARG", "value must be a .dlopt file path or null")
+            else:
+                desired = value.strip().replace("/", "\\")
+                if os.path.splitext(desired)[1].lower() != ".dlopt":
+                    return _err("BAD_ARG", "Linker Options must be a .dlopt file")
+                if not os.path.isabs(desired):
+                    model = getattr(self, "_path", None)
+                    if not model:
+                        return _err("BAD_ARG", "Use an absolute path for an unsaved model")
+                    desired = os.path.join(os.path.dirname(model), desired)
+                desired = os.path.abspath(desired)
+                if not os.path.isfile(desired):
+                    return _err("FILE_NOT_FOUND", desired)
+        try:
+            ole = self.app.Engine._oleobj_
+            # IHAPEngine.EngineFilesSettings: DISPID 1610743823;
+            # IAP_ENGINEFILES.IAP_LINKEROPT=9. Typed dispatch works without
+            # generating/installing Python COM wrappers on the student PC.
+            if write:
+                ole.InvokeTypes(1610743823, 0, 4, (24, 0),
+                                ((3, 1), (8, 1)), 9, desired)
+            now = ole.InvokeTypes(1610743823, 0, 2, (8, 0), ((3, 1),), 9) or ""
+            matches = (str(now) == "" if desired == "" else
+                       os.path.normcase(os.path.normpath(str(now))) ==
+                       os.path.normcase(os.path.normpath(desired))) if write else True
+            if not matches:
+                return _err("READBACK_MISMATCH", "Expected {!r}, read back {!r}".format(desired, now))
+            return _ok({"field": field, "value": now})
+        except Exception as exc:
+            return _err("COM_ERROR", repr(exc))
+
     # ══ 樹狀存取 ════════════════════════════════════════════════════
     def _node(self, path: str, child: str | None = None):
         """找一個節點。
@@ -2523,6 +2570,7 @@ class Bridge:
     # ══ 派送 ════════════════════════════════════════════════════════
     OPS = (
         "connect", "create_file", "open_file", "save", "close", "app_prop",
+        "engine_files",
         "get", "set", "children", "subtree", "add_element", "remove_element",
         "row",
         "run", "run_status", "reinit", "get_log",
