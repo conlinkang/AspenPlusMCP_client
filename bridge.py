@@ -781,13 +781,29 @@ class Bridge:
                 return _ok({"path": path, "export_type": int(export_type),
                             "written": _written(before, _stamps(path))})
             if path:
-                if overwrite is None:
-                    self.app.SaveAs(path)
-                else:
-                    self.app.SaveAs(path, bool(overwrite))
+                # 回報 9565：SaveAs 沒丟例外、指定的檔卻沒出現（重發同參才有）。回 saved 之前確認檔案真的在；
+                # 不在就再存一次，還不在就明講失敗，不要讓呼叫端以為存好了。
+                before = _stamps(path)
+                for attempt in (1, 2):
+                    if overwrite is None:
+                        self.app.SaveAs(path)
+                    else:
+                        self.app.SaveAs(path, bool(overwrite))
+                    after = _stamps(path)
+                    if after:
+                        break
+                    time.sleep(1.0)
+                    after = _stamps(path)
+                    if after:
+                        break
+                if not after:
+                    return _err("FILE_NOT_WRITTEN",
+                                "Aspen answered the save without an error, but no file named {} (or with another extension) "
+                                "exists afterwards, even after saving a second time. The model was NOT saved there."
+                                .format(path))
                 self._path = path
-            else:
-                self.app.Save()
+                return _ok({"path": path, "written": _written(before, after), "retried": attempt > 1})
+            self.app.Save()
             return _ok({"path": path})
         except Exception as exc:
             return _err("COM_ERROR", repr(exc))
