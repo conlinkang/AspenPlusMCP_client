@@ -14,6 +14,7 @@ from __future__ import annotations
 import glob
 import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -774,7 +775,26 @@ class Bridge:
                 if not path:
                     return _err("BAD_ARG", "path is required for export")
                 before = _stamps(path)
-                self.app.Export(int(export_type), path)
+                try:
+                    self.app.Export(int(export_type), path)
+                except Exception as exc:
+                    # 回報 efcc：Export 當掉時（COM -2147417851）檔案已經寫了一半，留在磁碟上。把這次呼叫寫出來的
+                    # 半成品刪掉，不然呼叫端以為有一個可用的檔。刪不掉就在錯誤裡講。
+                    gone, stuck = [], []
+                    folder = os.path.dirname(os.path.abspath(path))
+                    for name in _written(before, _stamps(path)):
+                        full = os.path.join(folder, name)
+                        try:
+                            os.remove(full)
+                            gone.append(name)
+                        except OSError:
+                            stuck.append(name)
+                    detail = repr(exc)
+                    if gone:
+                        detail += " | the half-written file was removed: {}".format(", ".join(gone))
+                    if stuck:
+                        detail += " | could not remove the half-written file(s): {}".format(", ".join(stuck))
+                    return _err("COM_ERROR", detail)
                 # 匯出成功與否要看檔案在不在，不能只看有沒有丟例外。
                 # 實測：報表格式在模型還沒跑過時，Export 回報成功卻什麼都沒寫出來。
                 # 而且 Aspen 會自己把副檔名換成該格式的，呼叫端要的檔名不一定算數。
@@ -805,6 +825,82 @@ class Bridge:
                 return _ok({"path": path, "written": _written(before, after), "retried": attempt > 1})
             self.app.Save()
             return _ok({"path": path})
+        except Exception as exc:
+            return _err("COM_ERROR", repr(exc))
+
+    def inp_clean(self, path: str) -> dict:
+        """把剛匯出的 .inp 裡「純組分性質表」（PROP-TABLE … ANAL-TYPE=PURE）拿掉（回報 12e7、e108，2026-10-30）。
+
+        Aspen 自己匯出的 ANAL-TYPE=PURE 性質表重開時一律被拒：`PROP-TABLE PURE-1 PROPS` … NO PROPERTIES ARE SPECIFIED
+        FOR THIS TABLE。實測三個 Aspen 範例都一樣（Industrial Scale Alkaline Electrolyzer、methanol synthesis lab reactor、
+        Diammonium Phosphate by TVA Process），不論表有沒有被停用；TXY 型的表沒有這個問題。缺的是哪一句沒找到，
+        所以只能拿掉整張表；.bkp 不受影響，表還在那裡。
+        拿掉的表如果被 `DISABLE` 段落列名，也一併從 DISABLE 拿掉，DISABLE 空了就整段拿掉。
+        只動 .inp、只改這一件事，其餘位元組原樣（latin-1 讀寫，換行不變）。
+        """
+        if not str(path).lower().endswith(".inp"):
+            return _err("BAD_ARG", "only an .inp file")
+        if not os.path.isfile(path):
+            return _err("FILE_NOT_FOUND", path)
+        if os.path.getsize(path) > 50_000_000:
+            return _err("TOO_BIG", "an inp larger than 50 MB is left alone")
+        try:
+            with open(path, "rb") as fh:
+                lines = fh.read().decode("latin-1").splitlines(True)
+
+            paras, cur = [], []
+            for ln in lines:
+                top = bool(ln.strip()) and not ln[0].isspace() and not ln.startswith(";")
+                if top and cur:
+                    paras.append(cur)
+                    cur = []
+                cur.append(ln)
+            if cur:
+                paras.append(cur)
+
+            kept, removed = [], []
+            for para in paras:
+                head = para[0].split()
+                if head[:1] == ["PROP-TABLE"] and len(head) >= 2:
+                    if any(re.search(r"\bANAL-TYPE\s*=\s*PURE\b", ln) for ln in para[1:]):
+                        removed.append(head[1])
+                        continue
+                kept.append(para)
+            if not removed:
+                return _ok({"cleaned": False, "removed_tables": []})
+
+            gone = set(removed)
+            result = []
+            for para in kept:
+                if para[0].split()[:1] != ["DISABLE"]:
+                    result.extend(para)
+                    continue
+                eol = "\r\n" if para[0].endswith("\r\n") else "\n"
+                new_para, items = [], 0
+                for i, ln in enumerate(para):
+                    toks = ln.split()
+                    body = toks[1:] if i == 0 else toks
+                    if body[:1] == ["PROP-TABLE"]:
+                        names = [t for t in body[1:] if t not in gone]
+                        if len(names) != len(body) - 1:
+                            if names:
+                                new_para.append("    PROP-TABLE " + " ".join(names) + eol)
+                                items += 1
+                            continue
+                    if body:
+                        items += 1
+                    new_para.append(ln)
+                if items == 0:
+                    continue
+                if new_para[0].split()[:1] != ["DISABLE"]:
+                    new_para.insert(0, "DISABLE " + eol)
+                result.extend(new_para)
+
+            tmp = path + ".tmp_clean"
+            with open(tmp, "wb") as fh:
+                fh.write("".join(result).encode("latin-1"))
+            os.replace(tmp, path)
+            return _ok({"cleaned": True, "removed_tables": removed, "path": path})
         except Exception as exc:
             return _err("COM_ERROR", repr(exc))
 
@@ -2592,7 +2688,7 @@ class Bridge:
         "run", "run_status", "reinit", "get_log",
         "ui_tree", "ui_find", "ui_wait", "ui_act", "sleep", "read_table",
         "clock", "fs_wait", "fs_list", "fs_read_text", "proc_status",
-        "ui_modal_dialogs", "component_search", "report_env", "report_file",
+        "ui_modal_dialogs", "component_search", "report_env", "report_file", "inp_clean",
     )
 
     def execute(self, op: str, args: dict | None = None) -> dict:
