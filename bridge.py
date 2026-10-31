@@ -966,11 +966,12 @@ class Bridge:
             if value is None:
                 desired = ""
             elif not isinstance(value, str) or not value.strip():
-                return _err("BAD_ARG", "value must be a .dlopt file path or null")
+                return _err("BAD_ARG", "value must be a .dlopt or .opt file path or null")
             else:
                 desired = value.strip().replace("/", "\\")
-                if os.path.splitext(desired)[1].lower() != ".dlopt":
-                    return _err("BAD_ARG", "Linker Options must be a .dlopt file")
+                # 回報 0b74：Aspen 自己存的 LINKEROPT 常是 .opt（官方範例 usrpa64.opt），COM 也照收（2026-10-31 實測）。
+                if os.path.splitext(desired)[1].lower() not in (".dlopt", ".opt"):
+                    return _err("BAD_ARG", "Linker Options must be a .dlopt or .opt file")
                 if not os.path.isabs(desired):
                     model = getattr(self, "_path", None)
                     if not model:
@@ -993,7 +994,17 @@ class Bridge:
                        os.path.normcase(os.path.normpath(desired))) if write else True
             if not matches:
                 return _err("READBACK_MISMATCH", "Expected {!r}, read back {!r}".format(desired, now))
-            return _ok({"field": field, "value": now})
+            out = {"field": field, "value": now}
+            if now:
+                # 檔案在不在：相對的檔名 Aspen 以模型所在的資料夾為準；檔案不在，run 會被拒而且沒有任何訊息（回報 0b74）。
+                full = str(now)
+                if not os.path.isabs(full):
+                    model = getattr(self, "_path", None)
+                    full = os.path.join(os.path.dirname(model), full) if model else full
+                full = os.path.abspath(full)
+                out["resolved"] = full
+                out["exists"] = os.path.isfile(full)
+            return _ok(out)
         except Exception as exc:
             return _err("COM_ERROR", repr(exc))
 
