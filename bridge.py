@@ -109,6 +109,14 @@ def _err(code: str, detail: str = "") -> dict:
             "error": {"code": code, "detail": text}}
 
 
+def _db_error_text(exc: Exception) -> str:
+    """ADO 錯誤只留來源、說明與 HRESULT；com_error 的 repr 很長，多個驅動串起來會被截掉。"""
+    info = getattr(exc, "excepinfo", None)
+    if info and len(info) > 5 and (info[1] or info[2]):
+        return "{} - {} ({})".format(info[1] or "", str(info[2] or "").strip(), info[5])
+    return repr(exc)[:200]
+
+
 # ── 有沒有可以操作的桌面 ────────────────────────────────────────────
 # UI 自動化（電解質精靈、經濟分析）要有一個真的在渲染的桌面。遠端連線
 # 中斷、或畫面鎖住時，視窗還在、行程還活著，但 UIA 找不到任何控制項。
@@ -2004,6 +2012,52 @@ class Bridge:
     # 只回報這份白名單上的行程 —— 雲端不能拿這個 op 列學生電腦上的其他程式。
     _WATCHABLE = ("icarusadapterexe.exe", "iccost.exe")
 
+    def engine_crashes(self, seconds: float = 600) -> dict:
+        """最近 seconds 秒內 Aspen 計算引擎（apmain.exe）的當機記錄（Windows 應用程式記錄、事件 1000）。
+
+        回報 2d73（2026-11-15）：BatchSep 讓 apmain.exe 在 acmexp.dll 裡當掉，GUI 自己重啟引擎、
+        「calculation engine has unexpectedly shut down」對話框被 SuppressDialogs 藏起來；MCP 只看到
+        沒有 Run-Status，就說成「輸入被拒」。只讀事件記錄，用 XML 的欄位名稱，跟系統語言無關。
+        """
+        import subprocess
+        import re
+        import xml.etree.ElementTree as ET
+        ms = int(max(1.0, min(float(seconds), 86400.0)) * 1000)
+        query = ("*[System[Provider[@Name='Application Error'] and (EventID=1000)"
+                 " and TimeCreated[timediff(@SystemTime) <= {}]]]".format(ms))
+        try:
+            run = subprocess.run(["wevtutil", "qe", "Application", "/q:" + query, "/f:xml",
+                                  "/rd:true", "/c:50"], capture_output=True, timeout=20,
+                                 creationflags=0x08000000)
+        except Exception as exc:
+            return _err("EVENT_LOG", repr(exc)[:200])
+        if run.returncode != 0:
+            return _err("EVENT_LOG", run.stderr.decode("mbcs", errors="replace")[:200])
+        text = run.stdout.decode("utf-8", errors="replace")
+        ns = "{http://schemas.microsoft.com/win/2004/08/events/event}"
+        crashes = []
+        for chunk in re.findall(r"<Event .*?</Event>", text, flags=re.S):
+            try:
+                ev = ET.fromstring(chunk)
+            except ET.ParseError:
+                continue
+            fields = {d.get("Name"): (d.text or "") for d in ev.iter(ns + "Data")}
+            if fields.get("AppName", "").lower() != "apmain.exe":
+                continue
+            when = ev.find(ns + "System/" + ns + "TimeCreated")
+            try:
+                pid = int(fields.get("ProcessId", "0"), 16)
+            except ValueError:
+                pid = None
+            crashes.append({"time_utc": when.get("SystemTime") if when is not None else None,
+                            "module": fields.get("ModuleName"),
+                            "module_path": fields.get("ModulePath"),
+                            "module_version": fields.get("ModuleVersion"),
+                            "exception_code": fields.get("ExceptionCode"),
+                            "engine_pid": pid,
+                            "engine_path": fields.get("AppPath")})
+        return _ok({"seconds": seconds, "crashes": crashes})
+
     def proc_status(self, sample_s: float = 0.5) -> dict:
         """白名單行程有沒有在跑、CPU 多少（取樣 sample_s 秒，單核百分比）。"""
         import ctypes
@@ -2388,18 +2442,22 @@ class Bridge:
             except Exception:
                 pass
             Bridge._DB_CACHE.pop(pick[1], None)
-        last = None
-        for prov in ("SQLOLEDB", "MSOLEDBSQL"):
+        # 2026-11-15 回報 3822：只回最後一個驅動的錯。MSOLEDBSQL（18 版）沒裝時，加了
+        # 「Use Encryption for Data=Optional」的字串回「初始化字串的格式與 OLE DB 規格不相符」，
+        # 把 SQLOLEDB 真正的失敗原因蓋掉了。現在每個驅動的錯都回；Optional 只有 19 版認得
+        # （19 不加會回 Encryption not supported），18 版不加（預設不加密）。
+        errors = []
+        for prov, extra in (("SQLOLEDB", ""),
+                            ("MSOLEDBSQL19", "Use Encryption for Data=Optional;"),
+                            ("MSOLEDBSQL", "")):
             conn = w32.Dispatch("ADODB.Connection")
             conn.ConnectionTimeout = 15
             text = ("Provider=" + prov + ";Data Source=" + pick[1]
-                    + ";Integrated Security=SSPI;")
-            if prov == "MSOLEDBSQL":
-                text += "Use Encryption for Data=Optional;"
+                    + ";Integrated Security=SSPI;" + extra)
             try:
                 conn.Open(text)
             except Exception as exc:
-                last = repr(exc)[:160]
+                errors.append(prov + ": " + _db_error_text(exc))
                 continue
             rs = conn.Execute("select name from sys.databases where name like 'APV[0-9]%'")[0]
             names = []
@@ -2412,7 +2470,8 @@ class Bridge:
             conn.Execute("use [" + names[0] + "]")
             Bridge._DB_CACHE[pick[1]] = (conn, names[0])
             return conn, names[0], pick[0]
-        raise RuntimeError("Could not open Aspen's component database: " + str(last))
+        raise RuntimeError("Could not open Aspen's component database (" + pick[1] + "): "
+                           + " | ".join(errors))
 
     @staticmethod
     def _db_rows(conn, sql: str, params: list) -> list:
@@ -2698,7 +2757,7 @@ class Bridge:
         "row",
         "run", "run_status", "reinit", "get_log",
         "ui_tree", "ui_find", "ui_wait", "ui_act", "sleep", "read_table",
-        "clock", "fs_wait", "fs_list", "fs_read_text", "proc_status",
+        "clock", "fs_wait", "fs_list", "fs_read_text", "proc_status", "engine_crashes",
         "ui_modal_dialogs", "component_search", "report_env", "report_file", "inp_clean",
     )
 
