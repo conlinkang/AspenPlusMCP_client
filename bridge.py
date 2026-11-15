@@ -25,6 +25,45 @@ from typing import Any
 import win32com.client as win32
 
 
+def _restore_folder_env() -> list:
+    """把少掉的 CommonProgramFiles／ProgramFiles 類環境變數照登錄檔補回來；回傳補了哪些。
+
+    回報 5e11／ab42（2026-11-15）：Codex 啟動 MCP 伺服器時只傳一部分環境變數，少了
+    CommonProgramFiles。SQLOLEDB 在登錄檔裡的路徑是 %CommonProgramFiles%\\System\\Ole DB\\sqloledb.dll
+    （REG_EXPAND_SZ），展開不了就「找不到提供者」；換 MSOLEDBSQL19 開得起來，第一個查詢又
+    「類別未登錄」。實測：拿掉這個變數就完全重現，Aspen 本身照常（它走 DCOM、另一個行程）。
+    只補「沒有」的，已經有的不動。os.environ 寫入會同步到行程的環境區塊，COM 展開路徑讀得到。
+    """
+    import winreg
+    pairs = (("CommonProgramFiles", "CommonFilesDir"),
+             ("CommonProgramFiles(x86)", "CommonFilesDir (x86)"),
+             ("CommonProgramW6432", "CommonW6432Dir"),
+             ("ProgramFiles", "ProgramFilesDir"),
+             ("ProgramFiles(x86)", "ProgramFilesDir (x86)"),
+             ("ProgramW6432", "ProgramW6432Dir"))
+    done = []
+    try:
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             chr(92).join(("SOFTWARE", "Microsoft", "Windows", "CurrentVersion")))
+    except OSError:
+        return done
+    with key:
+        for name, value_name in pairs:
+            if os.environ.get(name):
+                continue
+            try:
+                value = winreg.QueryValueEx(key, value_name)[0]
+            except OSError:
+                continue
+            if value:
+                os.environ[name] = value
+                done.append(name)
+    return done
+
+
+RESTORED_ENV = _restore_folder_env()
+
+
 class BridgeError(Exception):
     def __init__(self, code: str, detail: str = ""):
         super().__init__("{}: {}".format(code, detail))
@@ -2459,11 +2498,21 @@ class Bridge:
             except Exception as exc:
                 errors.append(prov + ": " + _db_error_text(exc))
                 continue
-            rs = conn.Execute("select name from sys.databases where name like 'APV[0-9]%'")[0]
-            names = []
-            while not rs.EOF:
-                names.append(rs.Fields(0).Value)
-                rs.MoveNext()
+            # 回報 5e11／ab42：開得起來、第一個查詢才丟「類別未登錄」（少了 CommonProgramFiles 時），
+            # 以前這裡沒接住，回的是沒頭沒尾的 com_error。
+            try:
+                rs = conn.Execute("select name from sys.databases where name like 'APV[0-9]%'")[0]
+                names = []
+                while not rs.EOF:
+                    names.append(rs.Fields(0).Value)
+                    rs.MoveNext()
+            except Exception as exc:
+                errors.append(prov + " (opened, first query failed): " + _db_error_text(exc))
+                try:
+                    conn.Close()
+                except Exception:
+                    pass
+                continue
             if not names:
                 conn.Close()
                 raise RuntimeError("The Aspen SQL instance has no APV<version> pure-component database")
@@ -2654,7 +2703,7 @@ class Bridge:
                "agent": self._file_facts(os.path.join(here, "agent.py")),
                "python": sys.version.split()[0], "platform": platform.platform(),
                "session_name": os.environ.get("SESSIONNAME"), "temp_dir": tempfile.gettempdir(),
-               "model_path": self._path}
+               "model_path": self._path, "restored_env": RESTORED_ENV}
         try:
             import ctypes
             lang = int(ctypes.windll.kernel32.GetUserDefaultUILanguage())
